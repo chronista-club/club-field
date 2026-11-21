@@ -1,0 +1,33 @@
+# club-field — Chronista Club の field を動かすプログラム。
+# 仕様: docs/spec/01-field.md ／ 設計: docs/design/01-field-program.md
+
+[package]
+name = "club-field"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/chronista-club/club-field"
+description = "Chronista Club の field を動かすプログラム"
+
+[lib]
+name = "field"
+path = "src/lib.rs"
+
+[[bin]]
+name = "field"
+path = "src/main.rs"
+
+[dependencies]
+# crates.io の package 名は club-unison、Rust の crate 名は unison
+club-unison = "2.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

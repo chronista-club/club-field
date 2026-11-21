@@ -1,0 +1,41 @@
+// field のプロトコル。
+//
+// 仕様: docs/spec/01-field.md ／ 設計: docs/design/01-field-program.md
+//
+// 「出ていく」という操作は無い。channel を閉じることが、出ていくこと。
+// field が止まると、field の側から channel が閉じられる。
+
+protocol "field" version="0.1.0" {
+    namespace "club.chronista.field"
+
+    channel "presence" from="client" lifetime="persistent" {
+        // 入る。1 つの channel で入れる field は 1 つ。
+        // 応答は、その時点の field の状態。入れないときは error だけが返る
+        request "Join" description="Enter a field and start receiving its ticks." {
+            field "owner" type="string" required=#true
+            field "name" type="string" required=#true
+            returns "JoinReply" {
+                field "owner" type="string"
+                field "name" type="string"
+                // "local" | "cloud"
+                field "place" type="string"
+                // 何代めか。field が立ち上がり直すたびに大きくなる
+                field "life" type="int"
+                // field の時計
+                field "tick" type="int"
+                // 入れなかった理由: "no_such_field" | "stopped" | "already_joined" | "bad_request"
+                field "error" type="string"
+            }
+        }
+
+        // field → 入っている人。その時点の field の状態を丸ごと。
+        // 受け取りが遅いと途中の tick は飛ばされるが、届く順番は入れ替わらない
+        event "Tick" {
+            field "owner" type="string" required=#true
+            field "name" type="string" required=#true
+            field "place" type="string" required=#true
+            field "life" type="int" required=#true
+            field "tick" type="int" required=#true
+        }
+    }
+}
