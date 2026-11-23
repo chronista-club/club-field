@@ -9,11 +9,14 @@
 //! 今の値だけを返す（途中の rev は畳まれる）。受け取りが遅い人に溜まるのは要素の数まで。
 //! モデルの `streamLatest`（要素ごとに順番どおり・新しいものだけ）に当たる。
 //! 古いものが畳まれるのは購読の中、つまり stream へ書き込む前。
+//!
+//! 置き換えの頼みは、値のバイト列（[`Bytes`]）をそのままタスクへ渡す（写さない）。
 
+use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::core::{Field, FieldError, FieldInfo, FieldKey, FieldSnapshot, VisitorId};
+use crate::core::{Field, FieldError, FieldInfo, FieldKey, FieldSnapshot, VisitorId, json_payload};
 use crate::sync::{SlotUpdate, Subscription};
 
 /// ある時点の field の様子（確かめ用）
@@ -33,7 +36,7 @@ enum Command {
     },
     Set {
         slot: String,
-        value: Value,
+        payload: Bytes,
         reply: oneshot::Sender<Result<SlotUpdate, FieldError>>,
     },
     Observe {
@@ -102,21 +105,31 @@ impl FieldHandle {
         answer.await.map_err(|_| FieldError::Stopped)?
     }
 
-    /// 置き換える: 要素の値を置き換えて確定する。確定した変動を返す
-    pub async fn set(
+    /// 置き換える: 要素の値（バイト列）を置き換えて確定する。確定した変動を返す。
+    /// 値の形の前提は [`Field::set_bytes`] と同じ（設計の D18）
+    pub async fn set_bytes(
         &self,
         slot: impl Into<String>,
-        value: Value,
+        payload: impl Into<Bytes>,
     ) -> Result<SlotUpdate, FieldError> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Set {
                 slot: slot.into(),
-                value,
+                payload: payload.into(),
                 reply,
             })
             .map_err(|_| FieldError::Stopped)?;
         answer.await.map_err(|_| FieldError::Stopped)?
+    }
+
+    /// 置き換える: JSON の値で（[`FieldHandle::set_bytes`] の便利な入口）
+    pub async fn set(
+        &self,
+        slot: impl Into<String>,
+        value: Value,
+    ) -> Result<SlotUpdate, FieldError> {
+        self.set_bytes(slot, json_payload(&value)).await
     }
 
     /// 入らずに見る（持ち主の手元の表示など）。field が止まっていれば `None`
@@ -180,8 +193,12 @@ pub fn spawn_field(mut field: Field) -> FieldHandle {
                 Some(Command::Leave { visitor }) => {
                     let _ = field.leave(visitor);
                 }
-                Some(Command::Set { slot, value, reply }) => {
-                    let _ = reply.send(field.set(&slot, value));
+                Some(Command::Set {
+                    slot,
+                    payload,
+                    reply,
+                }) => {
+                    let _ = reply.send(field.set_bytes(&slot, payload));
                 }
                 Some(Command::Observe { reply }) => {
                     let _ = reply.send(field.observe());
@@ -224,12 +241,7 @@ mod tests {
     }
 
     fn update(slot: &str, rev: u64, value: Value) -> SlotUpdate {
-        SlotUpdate {
-            life: 1,
-            slot: slot.into(),
-            rev,
-            value,
-        }
+        SlotUpdate::from_json(1, slot, rev, &value)
     }
 
     #[tokio::test]
@@ -240,12 +252,23 @@ mod tests {
         let status = field.status().await.unwrap();
         assert_eq!(
             status.snapshot.slots.get("light"),
-            Some(&SlotState {
-                rev: 2,
-                value: json!(2)
-            })
+            Some(&SlotState::from_json(2, &json!(2)))
         );
         assert_eq!(status.visitors, 0);
+    }
+
+    #[tokio::test]
+    async fn set_bytes_reaches_visitors_without_copy() {
+        let field = spawn();
+        let (_, mut presence) = field.join().await.unwrap();
+        // JSON でないバイト列（protobuf の varint の形）
+        let raw = Bytes::from_static(&[0x08, 0x96, 0x01]);
+        let confirmed = field.set_bytes("mesh", raw.clone()).await.unwrap();
+        assert_eq!(confirmed, SlotUpdate::from_bytes(1, "mesh", 1, raw.clone()));
+        assert_eq!(presence.next().await, Some(vec![confirmed]));
+        // 正本は、渡したバッファそのもの（タスクへ渡す間に写していない）
+        let status = field.status().await.unwrap();
+        assert_eq!(status.snapshot.slots["mesh"].payload.as_ptr(), raw.as_ptr());
     }
 
     #[tokio::test]

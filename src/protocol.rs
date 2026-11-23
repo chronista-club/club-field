@@ -232,7 +232,8 @@ async fn join(
 }
 
 /// 置き換えを頼まれた: field で確定し（中継なら上流へ運び）、確定した変動を返す。
-/// 空の要素名は、field に渡す前に（中継なら上流へ運ぶ前に）断る
+/// 空の要素名は、field に渡す前に（中継なら上流へ運ぶ前に）断る。
+/// 頼まれた値（[`SetRequest`] の `payload`）は、JSON に戻さず、バイト列のまま渡す
 async fn set(door: &Hosted, message: &ProtocolMessage) -> SetReply {
     let request = match parse_set_request(message) {
         Ok(request) => request,
@@ -244,11 +245,11 @@ async fn set(door: &Hosted, message: &ProtocolMessage) -> SetReply {
     };
     let confirmed = match door {
         Hosted::Field(field) => field
-            .set(request.slot, request.value)
+            .set_bytes(request.slot, request.payload)
             .await
             .map_err(field_refusal),
         // 上流が断った理由は、そのまま返す
-        Hosted::Relay(relay) => match relay.set(request.slot, request.value).await {
+        Hosted::Relay(relay) => match relay.set_bytes(request.slot, request.payload).await {
             // 上流に届いたか（確定したか）は分からない。確定していれば feed で届く。
             // どの中継の頼みかをログに残すため、ここで応答にする（into_set_reply の警告には鍵が無い）
             Err(SyncError::Unreachable(detail)) => {
@@ -263,7 +264,7 @@ async fn set(door: &Hosted, message: &ProtocolMessage) -> SetReply {
     into_set_reply(confirmed)
 }
 
-/// field の断りを、同期の層の断りに読み替える（`FieldHandle::set` が返すのは、
+/// field の断りを、同期の層の断りに読み替える（`FieldHandle::set_bytes` が返すのは、
 /// 止まっている か 要素の名前が空 のどちらか）
 fn field_refusal(error: FieldError) -> SyncError {
     match error {

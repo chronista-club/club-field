@@ -10,14 +10,19 @@
 //! - `registry` の 1 件        → [`Field`]（要素は中の [`Origin`] が持つ）
 //! - `isJoined` / `joined`     → [`Field::visitors`]
 //! - `join` / `leave`          → [`Field::join`] / [`Field::leave`]
-//! - `setSlot` / `commit`      → [`Field::set`]（どちらも Origin で確定する。頼みが届く道は protocol）
+//! - `setSlot` / `commit`      → [`Field::set_bytes`] / [`Field::set`]（どちらも Origin で確定する。頼みが届く道は protocol）
 //! - `stop` / `restart`        → [`Field::stop`] / [`Field::restart`]
 //!
 //! 知らせが届くまでの道のり（`inflight` / `receive`）と、入った人の手元の Slave はここには無い。
 //! それは runtime / protocol と、入ってくる側（client）の仕事。
+//!
+//! 要素の値の正本はバイト列（[`Bytes`]）。中身が JSON か protobuf（`buffa`）かは、field は問わない。
+//! JSON の値（[`Value`]）で置き換える [`Field::set`] は、詰めた JSON のバイト列にして
+//! [`Field::set_bytes`] を通る便利な入口。
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -67,7 +72,7 @@ pub struct FieldInfo {
     pub life: u64,
 }
 
-/// ある時点の field の状態: 名札と、要素ごとの `(rev, value)`。`Join` の応答の中身
+/// ある時点の field の状態: 名札と、要素ごとの `(rev, payload)`。`Join` の応答の中身
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldSnapshot {
     pub owner: String,
@@ -122,6 +127,11 @@ pub enum FieldError {
     EmptySlotName,
     #[error("代は前より大きくなければならない（前 {previous}、今回 {given}）")]
     LifeNotNewer { previous: u64, given: u64 },
+}
+
+/// JSON の値を、要素の値（バイト列）にする。詰めた JSON で、`unison::sync` の `set(Value)` と同じ形
+pub(crate) fn json_payload(value: &Value) -> Bytes {
+    Bytes::from(value.to_string())
 }
 
 /// field 1 つ
@@ -180,9 +190,14 @@ impl Field {
         FieldSnapshot::new(self.info(), self.origin.snapshot())
     }
 
-    /// ある要素の今の値
+    /// ある要素の今の値（バイト列は複製せず、共有する）
     pub fn get(&self, slot: &str) -> Option<SlotState> {
         self.origin.get(slot)
+    }
+
+    /// ある要素の今の値を、正本を借りたまま読む（[`SlotState::decode_view`] と組めば写さずに読める）
+    pub fn with_slot<R>(&self, slot: &str, read: impl FnOnce(&SlotState) -> R) -> Option<R> {
+        self.origin.with_slot(slot, read)
     }
 
     /// 入る: その時点の状態と、以後の変動の購読を受け取る
@@ -214,9 +229,18 @@ impl Field {
         }
     }
 
-    /// 置き換える: 要素の値を置き換えて確定する（その要素の rev が 1 つ進む）。
-    /// 持ち主が直接置き換えるときも、入っている人から頼まれたときも、ここを通る
-    pub fn set(&mut self, slot: &str, value: Value) -> Result<SlotUpdate, FieldError> {
+    /// 置き換える: 要素の値（バイト列）を置き換えて確定する（その要素の rev が 1 つ進む）。
+    /// 持ち主が直接置き換えるときも、入っている人から頼まれたときも、ここを通る。
+    /// バイト列は写さず、そのまま正本にする。
+    ///
+    /// 中身は問わないが、presence（JSON の道）を通った写しと同じ rev でバイト列を揃えるには、
+    /// [`Field::set`] が作る形（詰めた JSON）にする。JSON でない値や詰めていない JSON は、
+    /// 後から入った人の写しでは別のバイト列になる（設計の D18）
+    pub fn set_bytes(
+        &mut self,
+        slot: &str,
+        payload: impl Into<Bytes>,
+    ) -> Result<SlotUpdate, FieldError> {
         if !self.running {
             return Err(FieldError::Stopped);
         }
@@ -224,8 +248,13 @@ impl Field {
             return Err(FieldError::EmptySlotName);
         }
         self.origin
-            .set(slot, value)
+            .set_bytes(slot, payload)
             .map_err(|_| FieldError::Stopped)
+    }
+
+    /// 置き換える: JSON の値で（[`Field::set_bytes`] の便利な入口）
+    pub fn set(&mut self, slot: &str, value: Value) -> Result<SlotUpdate, FieldError> {
+        self.set_bytes(slot, json_payload(&value))
     }
 
     /// 止まる: 入っていた人は全員外れる（購読は、残りの変動を受け取ったあとに終わる）
@@ -264,14 +293,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::sync::{SetRequest, proto};
 
     fn mako_studio() -> Field {
         Field::new(FieldKey::new("mako", "studio"), Place::Local, 1)
     }
 
     fn state(rev: u64, value: Value) -> SlotState {
-        SlotState { rev, value }
+        SlotState::from_json(rev, &value)
     }
+
+    /// JSON でないバイト列（protobuf の varint の形）
+    const RAW: &[u8] = &[0x08, 0x96, 0x01];
 
     const V1: VisitorId = VisitorId(1);
     const V2: VisitorId = VisitorId(2);
@@ -285,6 +318,52 @@ mod tests {
         assert_eq!(field.get("light"), Some(state(2, json!(2))));
         assert_eq!(update.rev, 1);
         assert!(field.visitors().is_empty());
+    }
+
+    #[test]
+    fn set_bytes_keeps_payload_as_is() {
+        let mut field = mako_studio();
+        field.set("light", json!(1)).unwrap();
+        // JSON でないバイト列も、そのまま正本になる。rev は set と同じ列で進む
+        let update = field.set_bytes("light", RAW).unwrap();
+        assert_eq!((update.rev, update.as_bytes()), (2, RAW));
+        assert_eq!(field.get("light"), Some(SlotState::from_bytes(2, RAW)));
+    }
+
+    #[test]
+    fn set_bytes_follows_set_rules() {
+        let mut field = mako_studio();
+        assert_eq!(field.set_bytes("", RAW), Err(FieldError::EmptySlotName));
+        field.stop().unwrap();
+        assert_eq!(field.set_bytes("light", RAW), Err(FieldError::Stopped));
+    }
+
+    #[test]
+    fn with_slot_reads_protobuf_in_place() {
+        // protobuf の値の例として、unison の wire の型（SlotEntryProto）を借りる
+        let message = proto::SlotEntryProto {
+            slot: "inner".into(),
+            rev: 9,
+            payload: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let request = SetRequest::from_proto("mesh", &message);
+        let mut field = mako_studio();
+        field.set_bytes(&request.slot, request.payload).unwrap();
+        // 正本を借りたまま、写さずに読む
+        let read = field.with_slot("mesh", |state| {
+            let view = state
+                .decode_view::<proto::SlotEntryProtoView>()
+                .expect("protobuf として読めない");
+            (
+                state.rev,
+                view.slot.to_string(),
+                view.rev,
+                view.payload.to_vec(),
+            )
+        });
+        assert_eq!(read, Some((1, "inner".to_string(), 9, vec![1, 2, 3])));
+        assert_eq!(field.with_slot("camera", |state| state.rev), None);
     }
 
     #[test]

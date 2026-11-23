@@ -8,7 +8,8 @@
 //!
 //! - 下流が入る: 中継の手元の状態を、上流の field の名札を付けて渡す（[`RelayHandle::join`]）。
 //!   中継の手元は、上流より遅れていることがある
-//! - 下流が頼む: 中継の Slave の上流への口へ渡す（[`RelayHandle::set`]）。上流で確定した変動は、
+//! - 下流が頼む: 中継の Slave の上流への口へ渡す（[`RelayHandle::set_bytes`]）。上流が QUIC の field なら、
+//!   頼みは上流の presence（JSON の道）で運ばれる（設計の D18）。上流で確定した変動は、
 //!   応答の道で中継の Slave にも合流し、下流へは応答と feed の両方で届く。rev は Origin が振ったまま
 //! - 上流が止まる・切れる: 中継の Slave が閉じ、下流の購読が終わる。下流は外れ、以後は入れない
 //! - 中継が止まる（[`RelayHandle::stop`]）: 写しを手放して上流から出ていく。下流も同じく外れる
@@ -16,10 +17,11 @@
 //! 頼みを運ぶ間、lock は握らない（`Relay` の作り）。上流の返事を待っている頼みがあっても、
 //! ほかの下流の「入る」「頼む」は待たされない。
 
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::client::FieldSlave;
-use crate::core::{FieldError, FieldInfo, FieldKey, FieldSnapshot};
+use crate::core::{FieldError, FieldInfo, FieldKey, FieldSnapshot, json_payload};
 use crate::sync::{Relay, SlotUpdate, Subscription, SyncError};
 
 /// 中継を通して入っている、ということ。手放す（drop する）と出ていく
@@ -66,14 +68,26 @@ impl RelayHandle {
         Ok((FieldSnapshot::new(self.info.clone(), state), presence))
     }
 
-    /// 下流からの置き換えの頼みを、上流へ運ぶ。上流で確定した変動を返し、中継の手元にも合流させる。
-    /// 空の要素名は上流へ運ぶ前に断る。上流が断ったら、その理由をそのまま返す
+    /// 下流からの置き換えの頼み（値のバイト列）を、上流へ運ぶ。上流で確定した変動を返し、中継の手元にも合流させる。
+    /// 空の要素名は上流へ運ぶ前に断る。上流が断ったら、その理由をそのまま返す。
+    ///
+    /// 上流が QUIC の field（`field relay`）のときは、頼みは上流の presence（JSON の道）を通るので、
+    /// JSON でない値は化けて確定する（設計の D18）。バイト列のまま届くのは、上流が同じプロセスにあるときだけ
+    pub async fn set_bytes(
+        &self,
+        slot: impl Into<String>,
+        payload: impl Into<Bytes>,
+    ) -> Result<SlotUpdate, SyncError> {
+        self.relay.set_bytes(slot, payload).await
+    }
+
+    /// 下流からの置き換えの頼みを、JSON の値で（[`RelayHandle::set_bytes`] の便利な入口）
     pub async fn set(
         &self,
         slot: impl Into<String>,
         value: Value,
     ) -> Result<SlotUpdate, SyncError> {
-        self.relay.set(slot, value).await
+        self.set_bytes(slot, json_payload(&value)).await
     }
 
     /// 中継の手元の状態。止めていれば `None`
@@ -158,10 +172,7 @@ mod tests {
         assert_eq!(snapshot.info(), info(3));
         assert_eq!(
             snapshot.slots.get("light"),
-            Some(&SlotState {
-                rev: 1,
-                value: json!(1)
-            })
+            Some(&SlotState::from_json(1, &json!(1)))
         );
         assert_eq!(relay.snapshot(), Some(snapshot));
         assert_eq!(relay.visitors(), 1);
@@ -169,13 +180,23 @@ mod tests {
         origin.set("camera", json!("wide")).unwrap();
         assert_eq!(
             within("変動", presence.next()).await,
-            Some(vec![SlotUpdate {
-                life: 3,
-                slot: "camera".into(),
-                rev: 1,
-                value: json!("wide"),
-            }])
+            Some(vec![SlotUpdate::from_json(3, "camera", 1, &json!("wide"))])
         );
+    }
+
+    #[tokio::test]
+    async fn set_bytes_carries_payload_upstream_as_is() {
+        let origin = Origin::new(1);
+        let relay = relay_of(&origin);
+        // JSON でないバイト列（protobuf の varint の形）
+        let raw = Bytes::from_static(&[0x08, 0x96, 0x01]);
+        let confirmed = within("頼む", relay.set_bytes("mesh", raw.clone()))
+            .await
+            .unwrap();
+        assert_eq!(confirmed, SlotUpdate::from_bytes(1, "mesh", 1, raw.clone()));
+        // 上流の正本も、渡したバッファそのもの
+        let upstream = origin.get("mesh").unwrap();
+        assert_eq!((upstream.rev, upstream.payload.as_ptr()), (1, raw.as_ptr()));
     }
 
     #[tokio::test]

@@ -69,7 +69,9 @@ docs/model/check.sh     # モデルの検査（Quint。bun が要る。3 分ほ�
 | 同期（汎用） | [club-unison](https://github.com/chronista-club/club-unison) の `unison::sync` | Origin ↔ Slave の同期、QUIC の運び方、中継。field を知らない。field からは `field::sync` の名で見える |
 | field | `src/core.rs` ほか | 名札（持ち主・名前・場所）、入る・出ていく・止まる、中継に名札を付ける（`src/relay.rs`）、QUIC の入口 |
 
-`unison::sync` は、いまは club-unison の nightly にだけある。crates.io の版に入るまで、`Cargo.toml` で git の rev に固定している。
+`unison::sync` は crates.io の `club-unison` 2.4 から入っている（`Cargo.toml` は `club-unison = "2.4"`）。
+要素の値の正本はバイト列（`bytes::Bytes`）だが、入る人の道（presence）が JSON なので、field の値はいまは
+`set` が作る形（詰めた JSON）に限る（設計の D18）。
 
 ## ライセンス
 

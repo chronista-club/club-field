@@ -19,8 +19,10 @@ path = "src/main.rs"
 
 [dependencies]
 # crates.io の package 名は club-unison、Rust の crate 名は unison。
-# 同期の層（unison::sync）は nightly にだけある（PR #138）。crates.io に出るまで rev で固定する
-club-unison = { git = "https://github.com/chronista-club/club-unison", rev = "5ce4df3f774e3f2a7a055e9b0f283b0161613801" }
+# 同期の層（unison::sync）は 2.4 から（値の正本は `bytes::Bytes`、wire は `buffa`）
+club-unison = "2.4"
+# 要素の値の正本（unison::sync の payload）
+bytes = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

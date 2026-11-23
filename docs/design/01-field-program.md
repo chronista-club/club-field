@@ -2,7 +2,8 @@
 
 - 状態: 実装済み（2026-11-22、U1 の範囲）。正本と写し（Origin と Slave）の自動同期に作り替えた（2026-11-23）。
   QUIC で下流を待ち受ける中継（`field relay`）を足した（2026-11-23）。
-  汎用の同期の層（同期のコア・QUIC の運び方・中継）を club-unison の `unison::sync` へ移し、field はそれを使う形にした（2026-11-23）
+  汎用の同期の層（同期のコア・QUIC の運び方・中継）を club-unison の `unison::sync` へ移し、field はそれを使う形にした（2026-11-23）。
+  crates.io の club-unison 2.4（2.4.1）に追随し、要素の値の正本をバイト列（`bytes::Bytes`）にした（2026-11-24）
 - 仕様: [`docs/spec/01-field.md`](../spec/01-field.md)
 - モデル: [`docs/model/field.qnt`](../model/field.qnt)
 - コード: このレポ（`src/`、`schemas/`、`tests/`）
@@ -68,7 +69,7 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 
 | 部品 | ファイル | 役割 | IO |
 |---|---|---|---|
-| sync | club-unison の `unison::sync`（`src/lib.rs` で `pub use unison::sync;`） | 要素ごとの `(rev, value)`。Origin・Slave・購読・中継・QUIC の運び方の部品 | 運び方の部品がネットワークを使う |
+| sync | club-unison の `unison::sync`（`src/lib.rs` で `pub use unison::sync;`） | 要素ごとの `(rev, payload)`。Origin・Slave・購読・中継・QUIC の運び方の部品 | 運び方の部品がネットワークを使う |
 | core | `src/core.rs` | field の名札・入っている人・動いているか。要素は中の Origin | なし |
 | runtime | `src/runtime.rs` | field を 1 タスクで動かす | なし |
 | relay | `src/relay.rs` | 中継（`unison::sync::Relay`）に上流の field の名札を付け、`Host` で鍵から引けるようにする | なし（預かった写しの上流への口が、ネットワークを使う） |
@@ -90,7 +91,7 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 | D4 | プロセスと field | 1 プロセスが複数の field を持てる（1 field = 1 タスク）。`field up` は 1 つだけ動かす | 手元とクラウドで同じプログラムにする |
 | D5 | 変動の道のり | 順番どおり・新しいものだけ・応答の道あり・受け取る側で捨てる（モデルの `streamLatestMerge`） | モデルで、常に今の状態（どの道でも破れる）以外が全部成り立つ。応答の道を足しても合流する |
 | D6 | 「新しいものだけ」の作り | 購読（`sync::Subscription`）が、変わった要素の索引と、`tokio::sync::watch` の知らせ（通し番号だけ）から、前回より後に変わった要素の今の値を引く | 購読者ごとの待ち行列が無い。溜まるのは要素の数まで。古いものは stream に書き込む前に畳まれる |
-| D7 | 知らせに載せるもの | 要素 1 つぶんの `(life, slot, rev, value)`。値は丸ごと | 間引いても追いつける。前の代を捨てられる |
+| D7 | 知らせに載せるもの | 要素 1 つぶんの `(life, slot, rev, payload)`。値は丸ごと | 間引いても追いつける。前の代を捨てられる |
 | D8 | 代の決め方 | 起動した時刻（ミリ秒） | 保存なしで、立ち上がり直すたびに必ず大きくなる |
 | D9 | 同期の契機 | 要素が置き換えられたときだけ（変動駆動）。時計（tick）はやめた | 裁定 13。変わっていないものを送り続けない |
 | D10 | 持ち主 | `--owner` で名乗る。確かめない | 手元専用の段階 |
@@ -100,8 +101,8 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 | D14 | 道を 2 本に分ける | `presence`（入る人が開く。`Join` / `Set`）と `feed`（field が開く。`Update`） | 入る人が開く channel の event は、受け取る側の待ち行列（256 件）が満ちると黙って捨てられる（club-unison の `UnisonChannel`）。field が開く stream は受け取る側が直接読むので、取りこぼさず、遅ければ QUIC の流量制御が送る側を待たせる |
 | D15 | Slave の合流の決まり | 同じ代で、手元より新しい rev だけを受け入れる（`Slots::merge`） | 道がいくつあっても（応答、要素ごとの stream、中継）合流する。モデルの反例 2・4・5 を防ぐ |
 | D16 | 頼んだ人は応答でも合流させる | `Slave::set` は、確定した変動を応答で受け取り、手元にも合流させてから返る | 頼んだ側は、`set` が返った時点で確定した値を持つ（知らせを待たない）。知らせと順番が入れ替わっても D15 で戻らない |
-| D17 | 同期を汎用の部品に分ける | club-unison の `unison::sync`（PR #138、`5ce4df3`）。field の語彙を使わない。field の側には残さない（`src/sync.rs` は消し、`pub use unison::sync;` の 1 行にした） | 裁定 13。field で先に作って確かめた `src/sync.rs` と運び方・中継を、club-unison の側へそのまま移した。同じものを 2 か所に持たない |
-| D18 | 値の形 | JSON（`serde_json::Value`） | 中身の形（U2）がまだ決まっていない。unison の既定の codec も JSON |
+| D17 | 同期を汎用の部品に分ける | club-unison の `unison::sync`（PR #138 で入り、PR #139 で値の正本が `Bytes`、wire が `buffa` になった。crates.io の 2.4）。field の語彙を使わない。field の側には残さない（`src/sync.rs` は消し、`pub use unison::sync;` の 1 行にした） | 裁定 13。field で先に作って確かめた `src/sync.rs` と運び方・中継を、club-unison の側へそのまま移した。同じものを 2 か所に持たない |
+| D18 | 値の形 | 正本はバイト列（`bytes::Bytes`。`SlotState` / `SlotUpdate` / `SetRequest` の `payload`）。`core::Field` / `FieldHandle` の `set_bytes` は中身を問わず、写さずに正本にする（同じプロセスの中の受け渡しは写さない）。`feed`（buffa）は値の中身を変えずに運ぶ（送る側・受ける側でそれぞれ写す）。JSON の値で置き換える `set` は、詰めた JSON のバイト列にして `set_bytes` を通る便利な入口。ただし presence（`Join` の応答、`Set` の頼みと応答。QUIC の中継が上流へ頼みを運ぶ道も）は JSON の道なので、**field の値は当面 `set` が作る形（詰めた JSON）に限る**。この形なら、どの道を通っても同じ rev で同じバイト列になる。`set_bytes` で JSON でない値や詰めていない JSON を入れると、presence を通った写しとは同じ rev でバイト列が違う（モデルの `sameRevSameValue` がバイト単位で崩れる） | 中身の形（U2）がまだ決まっていない。unison の `unison::sync` の正本が `Bytes` になり（2.4）、protobuf（`buffa`）も JSON も同じ要素の上で扱えるようになった。field の中はそれに合わせる。presence を buffa にすれば端から端まで protobuf を通せるが、`Join` の中身（名札）と `schemas/field.kdl` が変わるので、この追随には入れない（下の「実装して分かったこと」「この先」） |
 | D19 | 要素の名前 | 空でなければ自由。空は断る（`bad_request`） | 中身の形と一緒に決める |
 | D20 | 中継の形 | `Origin` も `Slave` も `Source`（購読と、頼みの行き先）になる。`Slave::follow(&source)` で下流の Slave を作る | Slave も Origin と同じ形の状態を持つので、配り方も同じでよい。rev は Origin が振ったまま運ぶ |
 | D21 | 同時に出す頼みの数 | 1 つの Slave（presence 1 本）から同時に出す `Set` は 128 まで。超えたぶんは手元で待つ | field の側は presence の request を待ち行列（256 件）から 1 つずつ処理し、満ちると黙って捨てる（下の「実装して分かったこと」）。中継が下流の頼みをまとめて運ぶと、すぐ満ちる |
@@ -110,8 +111,8 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 | D24 | 中継が断る頼み | 空の要素名は、上流へ運ぶ前に断る（`bad_request`）。上流が断った理由はそのまま返す。上流に届かなかった頼みは `unreachable` | 無駄に上流まで往復しない。何段重ねても、断る理由は Origin のものが届く。`unreachable` は確定したかどうか分からない（確定していれば feed で届く）ので、`stopped` と分けた。ただし、頼みの途中で中継の上流へのつながりが切れると、D25 で `stopped` が返ることがある（このときも、確定したかは分からない。直後に下流は外される） |
 | D25 | 外れたら、返事を待っている頼みも終わる | `Slave::set`（`sync::Link`）は、上流の返事を待つ間に Slave が上流から外れたら、待つのをやめて `Closed` を返す。待つのは「閉じた」だけの知らせで、変動の知らせとは分ける | unison の `UnisonChannel::close` は返事待ちの request を解かず、request の時間切れ（30 秒）まで待たせる（下の「実装して分かったこと」）。中継が止まったとき、下流の頼みを抱えたタスクを残さない。変動の知らせ（`Version`）で待つと、変動のたびに返事待ちの頼みが全部起きる（下の「実装して分かったこと」） |
 | D26 | `field relay` の待ち受け先 | `--listen` は必須（既定なし）。ポート 0 なら空いているポート。loopback だけ（D11） | 中継は上流と同じマシンで動かすことが多く、`field up` の既定（`[::1]:7880`）とはぶつかる。既定のポート自体が仮（D13）なので、仮のポートをもう 1 つ増やさない |
-| D27 | club-unison の版の決め方 | git の rev で固定する（`5ce4df3f774e3f2a7a055e9b0f283b0161613801`、40 文字） | `unison::sync` は club-unison の nightly にだけあり、crates.io の版（2.3.0）には無い。branch で指すと、知らない間に中身が変わりうる。短い SHA は、あとで曖昧になりうる |
-| D28 | field の入口の組み方 | `unison::sync` の既製の入口（`SyncServer` / `serve_sync_channel` / `SyncTarget`、`ConnectedSlave::join`）は使わない。presence の応対と `Join` は field が持ち、`Set` / `Update` / feed / 入った後の写しは unison の部品（`spawn_feed`・`parse_set_request`・`into_set_reply`、`FeedAcceptor`・`ConnectedSlave::attach`）で組む。道の名前（`presence` / `feed`）とスキーマ（`schemas/field.kdl`）は変えない | 既製の入口は「1 つの待ち受け = 配り手 1 つ」で、`Join` に中身が無く、応答は名札の無い状態。field は 1 つの待ち受けに複数の field と中継を置き（D4、D22）、`Join` の名札で入る先を引き、応答に名札を付ける。部品で組めば、下流から見た受け答え（結合テスト 23 件）は 1 つも変わらない |
+| D27 | club-unison の版の決め方 | crates.io の版で指定する（`club-unison = "2.4"`。`Cargo.lock` は 2.4.1） | `unison::sync` が crates.io の 2.4 に入った。前は nightly にだけあったので git の rev（`5ce4df3`）で固定していた。2.4.0 と 2.4.1 はソースが同じ（2.4.1 は README と版番号だけ）なので、`"2.4"` のどちらでも組める |
+| D28 | field の入口の組み方 | `unison::sync` の既製の入口（`SyncServer` / `serve_sync_channel` / `SyncTarget`、`ConnectedSlave::join`）は使わない。presence の応対と `Join` は field が持ち、`Set` / `Update` / feed / 入った後の写しは unison の部品（`spawn_feed`・`parse_set_request`・`into_set_reply`、`FeedAcceptor`・`ConnectedSlave::attach`）で組む。道の名前（`presence` / `feed`）とスキーマ（`schemas/field.kdl`）は変えない | 既製の入口は「1 つの待ち受け = 配り手 1 つ」で、`Join` に中身が無く、応答は名札の無い状態。field は 1 つの待ち受けに複数の field と中継を置き（D4、D22）、`Join` の名札で入る先を引き、応答に名札を付ける。部品で組めば、下流から見た受け答え（結合テスト 23 件）は 1 つも変わらない（PR #4 の時点。club-unison 2.4 で、部品の `spawn_feed` が書く `Update` の wire は JSON から buffa になった。field の protocol の version は 0.1.0 のまま据え置く。まだ外に出していない） |
 
 D1〜D5 は mako の承認（2026-11-22「ok」）。D6〜D13 は claude の案で、同じ承認のもとで進めた。
 D5〜D7 の見直し、D9、D14〜D21 は、2026-11-23 の mako の裁定（GO、「あとはrecommendでOK」）のもとで claude が決めた。
@@ -119,6 +120,8 @@ D22〜D26 は、2026-11-23 の mako の裁定（「`field relay` を先に小さ
 lead から渡された task（`mem_1ChKHwzGspREaztdkR7CDP`）のもとで claude が決めた。
 D17 の改め、D27、D28 は、club-unison への輸出（`mem_1ChKdJTLL17QHAFpktCt6S`）を受けて lead から渡された task
 （`mem_1ChKfmFQhwDDA2TEvfuUUG`）のもとで claude が決めた。
+D17・D18・D27 の 2 度めの改め（club-unison 2.4 への追随）は、lead から渡された task（`mem_1ChLc7zqUyoDBGkF8b98Kc`）の
+もとで claude が決めた。D18 の「presence は JSON のまま、値は当面 JSON に限る」は lead に共有した。
 
 D2 と D3 は、当初 `chronista.club` レポの `field/` に置く案で承認され、そのとおり実装した。
 その後「ポータルとサーバが同居している」ことから、マージ前に別レポへ移すと mako が決め、
@@ -143,9 +146,9 @@ chronista-club の決まり（2026-05-15）に合わせている。
 |---|---|---|---|
 | `Join`（request） | presence | 入る人 → field | `owner`、`name` |
 | `Join` の応答 | presence | field → 入る人 | その時点の状態（名札と要素）。入れなかったら `error` |
-| `Set`（request） | presence | 入った人 → field | `slot`、`value` |
-| `Set` の応答 | presence | field → 頼んだ人 | 確定した変動 `(life, slot, rev, value)`。確定しなかったら `error` |
-| `Update`（event） | feed | field → 入っている人 | 要素 1 つぶんの変動 `(life, slot, rev, value)` |
+| `Set`（request） | presence | 入った人 → field | `slot`、`value`（JSON）。buffa の形（`SetRequestProto` の `slot`、`payload`）でも受け取る。field に直接入っていればそのバイト列のまま確定し、中継に入っていれば上流へ JSON で運ぶ（D18） |
+| `Set` の応答 | presence | field → 頼んだ人 | 確定した変動 `(life, slot, rev, value)`（JSON）。確定しなかったら `error` |
+| `Update`（event） | feed | field → 入っている人 | 要素 1 つぶんの変動。wire は buffa の `SlotUpdateProto`（`life`、`slot`、`rev`、`payload`）。値のバイト列の中身は変えない |
 | channel を閉じる | presence | どちらからでも | 入る人が閉じる = 出ていく。field が閉じる = 止まった（feed も閉じる） |
 
 `Join` の応答（状態 1 つ）の形:
@@ -157,11 +160,14 @@ chronista-club の決まり（2026-05-15）に合わせている。
 }
 ```
 
-`Update` と `Set` の応答の形:
+`Set` の応答の形（`Update` も、JSON で読むとこの形。受け取る側は buffa と JSON の両方を読む）:
 
 ```json
 { "life": 1795407248953, "slot": "light", "rev": 3, "value": 0.5 }
 ```
+
+JSON の形の `value` は、値のバイト列を JSON として読んだもの（`SlotState::value()`）。JSON として読めないバイト列は、
+バイトの数の配列になる（下の「実装して分かったこと」）。
 
 入るときの順番:
 
@@ -201,7 +207,7 @@ presence も閉じる（出ていったことになる）。`feed` を失った�
 |---|---|
 | `registry` | `Host` |
 | `Field { place, running, life, slots }` | `core::Field`（`slots` と `life` は中の `sync::Origin`） |
-| `SlotState { rev, value }` | `sync::SlotState` |
+| `SlotState { rev, value }` | `sync::SlotState`（値は `payload` のバイト列） |
 | `isJoined` / `joined` | `core::Field::visitors` |
 | `seen`（手元の Slave） | `sync::Slave`（client では `client::FieldSlave` の中の `sync::ConnectedSlave`） |
 | `via`（中継） | `Slave::follow(&slave)` で作った下流の Slave。QUIC では、`Host::relay` に預けた `FieldSlave`（`relay::RelayHandle` の中の `sync::Relay`）に入った下流の Slave |
@@ -209,8 +215,8 @@ presence も閉じる（出ていったことになる）。`feed` を失った�
 | `join` | `Join` → `FieldHandle::join` → `core::Field::join` |
 | `joinVia` | `Slave::follow(&relay)`。QUIC では、`field relay` の待ち受けに `Join` → `RelayHandle::join` |
 | `leave` | presence が閉じる → `Presence` を手放す → `core::Field::leave`。Slave を手放す → 下流の購読が終わる。中継が止まる（`RelayHandle::stop`）→ 中継の Slave を手放す |
-| `setSlot` | `FieldHandle::set`（`field up` の標準入力） |
-| `requestSet` / `commit` | `Slave::set` → `Set` → `FieldHandle::set` → `sync::Origin::set`。中継を通すときは `Set` → `RelayHandle::set` → 中継の Slave の上流への口 → `Set` → … |
+| `setSlot` | `FieldHandle::set` / `FieldHandle::set_bytes`（`field up` の標準入力は `set`） |
+| `requestSet` / `commit` | `Slave::set` → `Set` → `FieldHandle::set_bytes` → `sync::Origin::set_bytes`。中継を通すときは `Set` → `RelayHandle::set_bytes` → 中継の Slave の上流への口 → `Set` → … |
 | `receive`（Feed） | `ConnectedSlave` の吸い上げる係 → `Inlet::apply` → `Slots::merge` |
 | `receive`（Reply） | `Slave::set` が応答を `Slots::merge` |
 | `stop` | `FieldHandle::stop`（`field up` の Ctrl-C）→ `Origin::close` |
@@ -227,13 +233,14 @@ field が使うものと、その使い道:
 
 | 型・関数 | 役割 | field での使い道 |
 |---|---|---|
+| `SlotState` / `SlotUpdate` | 要素 1 つの状態と変動。値は `payload: Bytes`（複製は O(1)）。`value()` で JSON として、`decode_view` で protobuf として写さずに読む。`from_json` / `from_bytes` / `from_proto` で作る | 状態（`FieldSnapshot` の `slots`）と変動の中身。`field watch` などの表示は `value()` |
 | `Slots` | 要素の集まり（IO なし）。`set` で確定（Origin）、`merge` で合流（Slave）、`changes_since` で「ある時点より後に変わった要素の今の値」 | （`Origin` / `Slave` の中） |
-| `Origin` | 正本。`set` / `get` / `snapshot` / `subscribe` / `close`。`subscribe` は、購読した時点の状態と購読を別々に返す。空の要素名は `Refused("bad_request")` で断る | `core::Field` の要素と代 |
+| `Origin` | 正本。`set_bytes`（`set` / `set_json` / `set_proto` はその便利な入口）/ `get` / `with_slot` / `snapshot` / `subscribe` / `close`。`subscribe` は、購読した時点の状態と購読を別々に返す。空の要素名は `Refused("bad_request")` で断る | `core::Field` の要素と代 |
 | `Subscription` | 購読。`next()` で、購読した時点より後に変わった要素の今の値（途中の rev は畳まれる）。状態の写しは持たない | `runtime::Presence`、`observe` |
 | `Slave` / `Inlet` / `Upstream` / `Source` | 手元の写しと、その流し込み口・上流への口・配り手。外れると、上流の返事を待っている `set` も `Closed` で終わる（D25） | `client::FieldSlave` が `Slave` として読める |
 | `Relay` / `RelayPresence` | 上流に入っている写しを預かり、下流への配り手にする。頼みを運ぶ間 lock を握らない（D23） | `relay::RelayHandle` の中身 |
 | `FeedSource` / `spawn_feed` | 配り手の変動を server 起点の feed へ書き続ける係。止まったら presence も閉じる | `protocol` の feed（`Presence` / `RelayPresence` を `Visit` にまとめて渡す） |
-| `parse_set_request` / `into_set_reply` / `SetRequest` / `SetReply` / `JOIN` / `SET` / `UPDATE` | `Set` の検証と応答、名前 | `protocol` の `Set`（中継が上流に届かなかったときだけは、中継の鍵をログに残すため field が応答を作る） |
+| `parse_set_request` / `into_set_reply` / `SetRequest` / `SetReply` / `JOIN` / `SET` / `UPDATE` | `Set` の検証（JSON と buffa の両方を受ける）と応答、名前 | `protocol` の `Set`。`SetRequest` の `payload` を JSON に戻さず `set_bytes` へ渡す（中継が上流に届かなかったときだけは、中継の鍵をログに残すため field が応答を作る） |
 | `FeedAcceptor` / `ConnectedSlave` / `JoinError` / `FEED_PATIENCE` | 入る側: feed の受け口、入った後の写し（吸い上げる係と、同時に出す頼みの抑え。抑える数は `MAX_SETS_IN_FLIGHT`、D21） | `client`（`MAX_SETS_IN_FLIGHT` は `ConnectedSlave` の中で使われ、field からは直接使わない） |
 
 field が使わないもの: `SyncServer` / `serve_sync_channel` / `register_sync_channel` / `SyncTarget` /
@@ -247,18 +254,20 @@ cargo test
 
 | 段 | 場所 | 件数 | 内容 |
 |---|---|---|---|
-| core | `src/core.rs` | 17 | 操作ごとの振る舞い。IO なし |
-| runtime | `src/runtime.rs` | 11 | 受け取りが遅い人には最新だけが残る、戻らない、先に進まない、止まる |
-| relay | `src/relay.rs` | 3 | field が足したものだけ: 中継に入ると上流の field の名札が付いた状態と以後の変動が来る、上流が止まる・中継が止まると `FieldError::Stopped` で入れない。IO なし（同じプロセスの Origin を上流にする） |
+| core | `src/core.rs` | 20 | 操作ごとの振る舞い。`set_bytes` は JSON でないバイト列もそのまま正本にし、`set` と同じ rev の列・同じ断り方。`with_slot` で protobuf を写さずに読む。IO なし |
+| runtime | `src/runtime.rs` | 12 | 受け取りが遅い人には最新だけが残る、戻らない、先に進まない、止まる。`set_bytes` のバイト列は、タスクへ渡す間に写されない（同じバッファのまま） |
+| relay | `src/relay.rs` | 4 | field が足したものだけ: 中継に入ると上流の field の名札が付いた状態と以後の変動が来る、上流が止まる・中継が止まると `FieldError::Stopped` で入れない、`set_bytes` のバイト列が写されずに上流の正本になる。IO なし（同じプロセスの Origin を上流にする。本番の `field relay` は上流が QUIC の presence なので、写さないのは同じプロセスの中だけ。D18） |
 | host | `src/host.rs` | 7 | 複数の field、同名・別の持ち主、重複、中継を field と並べて置く、中継と field は同じ鍵に置けない |
 | protocol | `src/protocol.rs` | 2 | スキーマ（`schemas/field.kdl`）の名前が unison の運び方の名前（`Join` / `Set` / `Update`）と同じ、field の断りが `bad_request` / `stopped` に読み替わる |
-| 結合 | `tests/presence.rs` | 23 | 本物の QUIC。入る → 状態、Origin の変動が Slave に届く、Slave からの頼みが確定して他の Slave にも届く、何人もが入り混じって置き換えても全員が揃う、遅い利用者でも Slave は最新、QUIC の Slave を中継にする、出ていく、止まる、別々の field、断られる頼み、1 つの Slave から 3000 の頼みを一度に出しても全部確定する、feed を受け取らないクライアントは外される、入るのに失敗してもつながりが残らない。**QUIC の中継**（`Origin ──QUIC──▶ Relay ──QUIC──▶ Leaf`）: Origin の変動が Leaf に届く、Leaf の頼みが Origin で確定して中継・別の Leaf・直結の Slave に揃う、何人もが入り混じって置き換えても揃う、Leaf が出ていっても残りは動く、中継が止まるとその下流だけ外れる、Origin が止まると中継にも下流にも伝わり入れなくなる、3 段（`Origin → Relay 1 → Relay 2 → Leaf`）で上り下りが通る、上流の返事を待つ頼みがあってもほかの Leaf は入れて頼め、中継は空の要素名を上流へ運ばずに断り、中継を止めると返事待ちの頼みも終わる（`slow` にだけ返事をしない偽の上流で） |
+| 結合 | `tests/presence.rs` | 26 | 本物の QUIC。入る → 状態、Origin の変動が Slave に届く、Slave からの頼みが確定して他の Slave にも届く、何人もが入り混じって置き換えても全員が揃う、遅い利用者でも Slave は最新、QUIC の Slave を中継にする、出ていく、止まる、別々の field、断られる頼み、1 つの Slave から 3000 の頼みを一度に出しても全部確定する、feed を受け取らないクライアントは外される、入るのに失敗してもつながりが残らない。**QUIC の中継**（`Origin ──QUIC──▶ Relay ──QUIC──▶ Leaf`）: Origin の変動が Leaf に届く、Leaf の頼みが Origin で確定して中継・別の Leaf・直結の Slave に揃う、何人もが入り混じって置き換えても揃う、Leaf が出ていっても残りは動く、中継が止まるとその下流だけ外れる、Origin が止まると中継にも下流にも伝わり入れなくなる、3 段（`Origin → Relay 1 → Relay 2 → Leaf`）で上り下りが通る、上流の返事を待つ頼みがあってもほかの Leaf は入れて頼め、中継は空の要素名を上流へ運ばずに断り、中継を止めると返事待ちの頼みも終わる（`slow` にだけ返事をしない偽の上流で）。**値のバイト列**: 持ち主が置き換えた protobuf と JSON でないバイト列が、feed を通って直結の Slave にも中継を経た Leaf にもそのまま届き、`with_slot` + `decode_view` で読める。presence に buffa の形で届いた `Set` の値が、JSON に戻されずにそのまま正本になり、ほかの人にも feed でそのまま届く（`protocol` の `set` を JSON の往復に戻すと落ちることを確かめた）。`set(Value)` が作る詰めた JSON は、`Join` の応答と `Set` の頼み・応答（JSON の道）を通っても正本とバイト単位で同じ（JSON を整形して書く形に変えると落ちることを確かめた） |
 
 同期のコアと中継そのものの振る舞い（前は `src/sync.rs` の 27 件と `src/relay.rs` の 7 件）は、club-unison の側で確かめる
 （`crates/unison-protocol/tests/test_small_sync.rs`。QUIC の運び方は `test_medium_sync.rs`）。field の側に同じテストは置かない。
 
 結合テストは、続けて 15 回と、6 本並べて 5 回（30 回）の計 45 回回して、落ちなかった（2026-11-23、macOS。
-`unison::sync` へ切り替えた後にも同じ回数を回し、落ちなかった）。
+`unison::sync` へ切り替えた後にも同じ回数を回し、落ちなかった）。club-unison 2.4 に追随した後は、続けて 15 回と 6 本並べて 3 回（計 33 回、
+2026-11-24、macOS）回して、落ちなかった。moody-blues も別に、`json_values_keep_bytes_through_presence` を足す前の 25 件を
+続けて 40 回と 6 本並べて 15 回（計 130 回）回して、落ちなかった。
 
 ## 実装して分かったこと
 
@@ -324,6 +333,35 @@ sync の `pending_set_ends_when_slave_is_closed` / `pending_relayed_set_ends_whe
 送る側（field）で畳まれるのは、`feed` への書き込みが詰まったときに限られる。
 いまの大きさ（loopback、値が小さい）では詰まらず、送る側で畳まれる様子は測っていない。
 
+### presence を通ると、JSON でない値は化ける
+
+club-unison 2.4 で、`unison::sync` の値の正本はバイト列（`Bytes`）になり、`feed` は buffa（`SlotUpdateProto`）で
+値のバイト列を中身を変えずに運ぶようになった。一方、field の presence は JSON の channel のまま（`Join` の中身と応答が
+field の名札を持つ serde の型なので）。JSON の channel は、`SlotState` / `SlotUpdate` / `SetRequest` を
+`{ "rev", "value" }` などの JSON の形で運び、`value` には値のバイト列を JSON として読んだもの（`value()`）が入る。
+
+結合テストの形で測った（2026-11-24）:
+
+| 道 | JSON でないバイト列 `08 96 01` | JSON の object `{"b":1,"a":2}` |
+|---|---|---|
+| `feed`（buffa） | そのまま届く | そのまま届く |
+| `Join` の応答（JSON） | `[8,150,1]` に化ける | 意味は同じ。キーは並べ替わる（`{"a":2,"b":1}`） |
+| `FieldSlave::set_bytes` → `Set`（JSON）→ Origin | `[8,150,1]` で確定し、応答もその形 | 意味は同じ。キーが並べ替わった形で確定する |
+| `Set` を buffa の形で field に直接送る → Origin | そのまま確定する（応答は JSON の形） | そのまま確定する（JSON の形の応答では、キーが並べ替わる） |
+| `Set` を buffa の形で中継へ送る → Origin | `[8,150,1]` で確定する（中継が上流へ JSON で運ぶ） | キーが並べ替わった形で確定する |
+| `RelayHandle::set_bytes`（上流が QUIC の field）→ Origin | `[8,150,1]` で確定する | キーが並べ替わった形で確定する |
+
+`FieldSlave` は `Slave` として `set_bytes` / `set_proto` を持つが、field の presence を通る限り、
+JSON でない値は Origin で化けた形のまま確定する。JSON の値も、詰めていない形やキーの順番は保たれない。
+一方、`set(Value)` が作る形（詰めた JSON。serde_json の既定でキーは並べた順）は、どの道を通っても同じバイト列に戻る
+（結合テストの `json_values_keep_bytes_through_presence`）。だから field の値は当面この形に限る（D18）。
+protobuf を端から端まで通すには、presence を buffa にする（「この先」）。
+
+buffa の形の `Set` を受けるかどうかは、unison の `parse_set_request` が、先頭の空白を読み飛ばした最初のバイトが
+`{` かどうかで見分ける。`SetRequestProto` の先頭は要素名のタグ `0x0A`（改行と同じ値）なので、要素名の長さが
+123 バイト（長さの値が `{` と同じ）のときや、長さが空白と同じ値（9・10・12・13・32 バイト）で要素名が `{` から始まるときは、
+JSON と見なされて `bad_request` で断られる（moody-blues のレビューで測った。club-unison の側の話で、field では直さない）。
+
 ### 確かめていないこと
 
 - 自分のマシンの外からの接続（loopback 以外では起動しない）
@@ -336,7 +374,7 @@ sync の `pending_set_ends_when_slave_is_closed` / `pending_relayed_set_ends_whe
 
 | 項目 | 内容 |
 |---|---|
-| unison の版に戻す | `unison::sync` が crates.io の版に入ったら、git の rev（D27）をやめて版で指定する |
+| presence を buffa に | `Join` / `Set` の中身と応答を buffa にし、protobuf の値を端から端まで（`Join` の応答・`Set` の頼みと応答も）バイト列のまま通す。`Join` の名札の載せ方と `schemas/field.kdl` が変わる。いまは値を JSON に限っている（D18、「presence を通ると、JSON でない値は化ける」） |
 | 中継の案内 | どの中継に入るかを案内する・中継が止まったら別の中継や Origin へつなぎ替える。住所・認可と一緒に |
 | 要素ごとの道 | 要素ごとに `feed` を分ける・優先度をつける。合流の決まり（D15）はそのまま使える |
 | 書き手と読み手 | 頼める人を絞る（演者だけが書く）。認可と一緒に |
