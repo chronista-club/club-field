@@ -2,16 +2,21 @@
 //
 // 仕様: docs/spec/01-field.md ／ 設計: docs/design/01-field-program.md
 //
-// 「出ていく」という操作は無い。channel を閉じることが、出ていくこと。
-// field が止まると、field の側から channel が閉じられる。
+// 入った人の手元には、field の写し（Slave）ができる。道は 2 本:
+// - presence（入る人が開く）: 入る（Join）と、置き換えの頼み（Set）
+// - feed（field が開く）: 要素の変動（Update）。入った人の Slave が吸い上げる
+//
+// 「出ていく」という操作は無い。presence を閉じることが、出ていくこと。
+// field が止まると、field の側から feed と presence が閉じられる。
 
 protocol "field" version="0.1.0" {
     namespace "club.chronista.field"
 
     channel "presence" from="client" lifetime="persistent" {
         // 入る。1 つの channel で入れる field は 1 つ。
-        // 応答は、その時点の field の状態。入れないときは error だけが返る
-        request "Join" description="Enter a field and start receiving its ticks." {
+        // 応答は、その時点の field の状態。入れないときは error だけが返る。
+        // 応答の前に、field の側から feed が開かれる
+        request "Join" description="Enter a field. Returns its current state; later changes arrive on the feed channel." {
             field "owner" type="string" required=#true
             field "name" type="string" required=#true
             returns "JoinReply" {
@@ -21,21 +26,38 @@ protocol "field" version="0.1.0" {
                 field "place" type="string"
                 // 何代めか。field が立ち上がり直すたびに大きくなる
                 field "life" type="int"
-                // field の時計
-                field "tick" type="int"
-                // 入れなかった理由: "no_such_field" | "stopped" | "already_joined" | "bad_request"
+                // 要素ごとの状態: { "<要素名>": { "rev": int, "value": any } }
+                field "slots" type="json"
+                // 入れなかった理由: "no_such_field" | "stopped" | "already_joined" | "bad_request" | "feed_unavailable"
                 field "error" type="string"
             }
         }
 
-        // field → 入っている人。その時点の field の状態を丸ごと。
-        // 受け取りが遅いと途中の tick は飛ばされるが、届く順番は入れ替わらない
-        event "Tick" {
-            field "owner" type="string" required=#true
-            field "name" type="string" required=#true
-            field "place" type="string" required=#true
+        // 置き換えを頼む。field（Origin）が、その要素の rev を 1 つ進めて確定する。
+        // 応答は確定した変動。同じ変動は、入っている全員（頼んだ人も）に feed でも届く
+        request "Set" description="Ask the field to replace one slot. The field confirms it with the next rev." {
+            field "slot" type="string" required=#true
+            field "value" type="json" required=#true
+            returns "SetReply" {
+                field "life" type="int"
+                field "slot" type="string"
+                field "rev" type="int"
+                field "value" type="json"
+                // 確定しなかった理由: "not_joined" | "stopped" | "bad_request"
+                field "error" type="string"
+            }
+        }
+    }
+
+    channel "feed" from="server" lifetime="persistent" {
+        // field → 入っている人。要素 1 つの変動。
+        // 受け取りが遅いと、同じ要素の途中の rev は飛ばされ、最新の値だけが届く。
+        // 受け取る側は、同じ代で、手元より新しい rev だけを受け入れる
+        event "Update" {
             field "life" type="int" required=#true
-            field "tick" type="int" required=#true
+            field "slot" type="string" required=#true
+            field "rev" type="int" required=#true
+            field "value" type="json" required=#true
         }
     }
 }

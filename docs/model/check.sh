@@ -3,7 +3,7 @@
 #
 #   docs/model/check.sh
 #
-# 道のりの 5 通りそれぞれについて、場面の確かめ（quint test）と、
+# 道のりの 7 通りそれぞれについて、場面の確かめ（quint test）と、
 # 性質の成否（quint run）を実行し、期待と突き合わせる。
 # quint run はランダムな操作列を多数試す方式で、全状態の網羅ではない。
 set -u
@@ -29,35 +29,46 @@ fi
 # 期待: ok = 成り立つ / ng = 破れる（反例が見つかる）
 # 列: 道のり  性質  期待
 EXPECT="
-dgramNaive    allInvariants      ng
-dgramNaive    seenNeverGoesBack  ng
-dgramNaive    quietMeansCurrent  ng
-dgramNaive    backlogAtMostTwo   ng
-dgramNaive    alwaysCurrent      ng
-dgramDiscard  allInvariants      ng
-dgramDiscard  seenNeverGoesBack  ok
-dgramDiscard  quietMeansCurrent  ng
-dgramDiscard  backlogAtMostTwo   ng
-dgramDiscard  alwaysCurrent      ng
-streamAll     allInvariants      ok
-streamAll     seenNeverGoesBack  ok
-streamAll     quietMeansCurrent  ok
-streamAll     backlogAtMostTwo   ng
-streamAll     alwaysCurrent      ng
-streamLatest  allInvariants      ok
-streamLatest  seenNeverGoesBack  ok
-streamLatest  quietMeansCurrent  ok
-streamLatest  backlogAtMostTwo   ok
-streamLatest  alwaysCurrent      ng
-dgramDiscardLife  allInvariants      ok
-dgramDiscardLife  seenNeverGoesBack  ok
-dgramDiscardLife  quietMeansCurrent  ng
-dgramDiscardLife  backlogAtMostTwo   ng
-dgramDiscardLife  alwaysCurrent      ng
+dgramNaive         allInvariants      ng
+dgramNaive         seenNeverGoesBack  ng
+dgramNaive         quietMeansCurrent  ng
+dgramNaive         backlogAtMostTwo   ng
+dgramNaive         alwaysCurrent      ng
+dgramDiscard       allInvariants      ng
+dgramDiscard       seenNeverGoesBack  ok
+dgramDiscard       quietMeansCurrent  ng
+dgramDiscard       backlogAtMostTwo   ng
+dgramDiscard       alwaysCurrent      ng
+dgramDiscardLife   allInvariants      ok
+dgramDiscardLife   seenNeverGoesBack  ok
+dgramDiscardLife   quietMeansCurrent  ng
+dgramDiscardLife   backlogAtMostTwo   ng
+dgramDiscardLife   alwaysCurrent      ng
+streamAll          allInvariants      ok
+streamAll          seenNeverGoesBack  ok
+streamAll          quietMeansCurrent  ok
+streamAll          backlogAtMostTwo   ng
+streamAll          alwaysCurrent      ng
+streamLatest       allInvariants      ok
+streamLatest       seenNeverGoesBack  ok
+streamLatest       quietMeansCurrent  ok
+streamLatest       backlogAtMostTwo   ok
+streamLatest       alwaysCurrent      ng
+streamLatestEcho   allInvariants      ok
+streamLatestEcho   seenNeverGoesBack  ng
+streamLatestEcho   quietMeansCurrent  ng
+streamLatestEcho   backlogAtMostTwo   ok
+streamLatestEcho   alwaysCurrent      ng
+streamLatestMerge  allInvariants      ok
+streamLatestMerge  seenNeverGoesBack  ok
+streamLatestMerge  quietMeansCurrent  ok
+streamLatestMerge  backlogAtMostTwo   ok
+streamLatestMerge  alwaysCurrent      ng
 "
 
 echo "== 場面の確かめ =="
-for main in dgramNaive dgramDiscard streamAll streamLatest dgramDiscardLife; do
+MODULES="dgramNaive dgramDiscard dgramDiscardLife streamAll streamLatest streamLatestEcho streamLatestMerge"
+for main in $MODULES; do
   out=$(quint test "$MODEL" --main="$main" 2>&1)
   summary=$(echo "$out" | grep -E "passing|failing" | tr '\n' ' ')
   # 「passing があり、failing が無い」ときだけ OK。出力が無いのは失敗として扱う
@@ -72,7 +83,7 @@ done
 
 echo
 echo "== 性質の成否（${SAMPLES} 本 × ${STEPS} 手）=="
-printf '%-4s %-17s %-18s %-6s %s\n' "" "道のり" "性質" "期待" "結果"
+printf '%-4s %-18s %-18s %-6s %s\n' "" "道のり" "性質" "期待" "結果"
 while read -r main inv expect; do
   [ -z "$main" ] && continue
   out=$(quint run "$MODEL" --main="$main" --invariant="$inv" \
@@ -85,7 +96,7 @@ while read -r main inv expect; do
     actual=error
   fi
   if [ "$actual" = "$expect" ]; then mark=OK; else mark=NG; failed=1; fi
-  printf '%-4s %-17s %-18s %-6s %s\n' "$mark" "$main" "$inv" "$expect" "$actual"
+  printf '%-4s %-18s %-18s %-6s %s\n' "$mark" "$main" "$inv" "$expect" "$actual"
   [ "$actual" = "error" ] && echo "$out" | tail -8
 done <<< "$EXPECT"
 
