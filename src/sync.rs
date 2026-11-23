@@ -211,6 +211,8 @@ struct Version {
 struct Shared {
     slots: Mutex<Slots>,
     version: watch::Sender<Version>,
+    /// 閉じたことだけの知らせ。返事を待つ頼み（[`Link`]）が使う。変動では起きない
+    closed: watch::Sender<bool>,
 }
 
 impl Shared {
@@ -219,9 +221,11 @@ impl Shared {
             seq: slots.seq(),
             closed: false,
         });
+        let (closed, _) = watch::channel(false);
         Arc::new(Self {
             slots: Mutex::new(slots),
             version,
+            closed,
         })
     }
 
@@ -247,6 +251,8 @@ impl Shared {
             version.closed = true;
             !was
         });
+        self.closed
+            .send_if_modified(|closed| !std::mem::replace(closed, true));
     }
 
     fn is_closed(&self) -> bool {
@@ -424,12 +430,13 @@ impl Upstream for Link {
                 return Err(SyncError::Closed);
             }
             // 返事を待つ間に上流から外れたら、待つのをやめる。
-            // 外れた上流の返事は、届かないか、届いても遅れて（運び方の時間切れで）しか来ない
-            let mut version = self.shared.version.subscribe();
+            // 外れた上流の返事は、届かないか、届いても遅れて（運び方の時間切れで）しか来ない。
+            // 待つのは「閉じた」だけの知らせ。変動の知らせ（version）だと、変動のたびに起きてしまう
+            let mut closed = self.shared.closed.subscribe();
             let confirmed = tokio::select! {
                 biased;
                 confirmed = self.upstream.set(slot, value) => confirmed?,
-                _ = version.wait_for(|version| version.closed) => return Err(SyncError::Closed),
+                _ = closed.wait_for(|closed| *closed) => return Err(SyncError::Closed),
             };
             // 応答の道でも合流させる。頼んだ側は、変動の知らせを待たずに確定した値を持つ。
             // 知らせのほうが先に届いていても、古い rev は捨てられるので戻らない
@@ -855,6 +862,52 @@ mod tests {
         });
         tokio::task::yield_now().await;
         // 上流から外れたら、返事を待っている頼みも終わる（上流の返事を待ち続けない）
+        inlet.close();
+        assert_eq!(
+            within("頼みが終わる", pending).await.unwrap(),
+            Err(SyncError::Closed)
+        );
+    }
+
+    /// 返事をせず、何度 poll されたかを数える上流
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Upstream for Counting {
+        fn set(&self, _slot: String, _value: Value) -> SetFuture<'_> {
+            let polls = self.0.clone();
+            Box::pin(std::future::poll_fn(move |_| {
+                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::task::Poll::Pending
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_set_is_not_woken_by_updates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let snapshot = Snapshot {
+            life: 1,
+            ..Snapshot::default()
+        };
+        let (slave, inlet) = Slave::new(snapshot, Arc::new(Counting(polls.clone())));
+        let slave = Arc::new(slave);
+        let pending = tokio::spawn({
+            let slave = slave.clone();
+            async move { slave.set("light", json!(0)).await }
+        });
+        until("頼みが上流へ出る", || {
+            polls.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        let before = polls.load(Ordering::Relaxed);
+        for rev in 1..=100 {
+            assert!(inlet.apply(&update(1, "camera", rev, json!(rev))));
+            tokio::task::yield_now().await;
+        }
+        // 返事を待つ頼みは、変動の知らせでは起きない（何千もの頼みが待っていても、変動のたびに全部は起きない）
+        assert_eq!(polls.load(Ordering::Relaxed), before);
         inlet.close();
         assert_eq!(
             within("頼みが終わる", pending).await.unwrap(),

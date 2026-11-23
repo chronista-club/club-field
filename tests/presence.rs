@@ -857,71 +857,82 @@ async fn relay_chain_over_quic() {
     origin_server.shutdown().await;
 }
 
-/// `slow` という要素の頼みにだけ返事をしない、偽の上流（field の代わり）
-async fn start_stalling_upstream() -> unison::network::server::ServerHandle {
+/// 偽の上流（field の代わり）。`slow` という要素の頼みにだけ返事をせず、届いたことを知らせる。
+/// それ以外の頼みは、空の要素名でも何でも確定させる
+async fn start_stalling_upstream() -> (
+    unison::network::server::ServerHandle,
+    Arc<tokio::sync::Notify>,
+) {
     use unison::network::{MessageType, UnisonChannel};
 
+    let heard_slow = Arc::new(tokio::sync::Notify::new());
     let server = unison::ProtocolServer::with_identity(PROTOCOL_NAME, "0.0.0", NAMESPACE);
+    let heard = heard_slow.clone();
     server
-        .register_channel(PRESENCE, |ctx, stream| async move {
-            let channel = UnisonChannel::new(stream);
-            let mut rev = 0;
-            // feed は開いたまま持っておく（何も書かない）
-            let mut _feed = None;
-            loop {
-                let Ok(message) = channel.recv().await else {
-                    return Ok(());
-                };
-                if message.msg_type != MessageType::Request {
-                    continue;
-                }
-                match message.method.as_str() {
-                    JOIN => {
-                        _feed = Some(ctx.open_server_stream(FEED).await?);
-                        let snapshot = FieldSnapshot {
-                            owner: "mako".into(),
-                            name: "studio".into(),
-                            place: Place::Local,
-                            life: 1,
-                            slots: BTreeMap::new(),
-                        };
-                        channel
-                            .send_response(message.id, JOIN, &JoinReply::Joined(snapshot))
-                            .await?;
+        .register_channel(PRESENCE, move |ctx, stream| {
+            let heard = heard.clone();
+            async move {
+                let channel = UnisonChannel::new(stream);
+                let mut rev = 0;
+                // feed は開いたまま持っておく（何も書かない）
+                let mut _feed = None;
+                loop {
+                    let Ok(message) = channel.recv().await else {
+                        return Ok(());
+                    };
+                    if message.msg_type != MessageType::Request {
+                        continue;
                     }
-                    SET => {
-                        let request: SetRequest =
-                            serde_json::from_value(message.payload_as_value()?).unwrap();
-                        if request.slot == "slow" {
-                            continue;
+                    match message.method.as_str() {
+                        JOIN => {
+                            _feed = Some(ctx.open_server_stream(FEED).await?);
+                            let snapshot = FieldSnapshot {
+                                owner: "mako".into(),
+                                name: "studio".into(),
+                                place: Place::Local,
+                                life: 1,
+                                slots: BTreeMap::new(),
+                            };
+                            channel
+                                .send_response(message.id, JOIN, &JoinReply::Joined(snapshot))
+                                .await?;
                         }
-                        rev += 1;
-                        let update = SlotUpdate {
-                            life: 1,
-                            slot: request.slot,
-                            rev,
-                            value: request.value,
-                        };
-                        channel
-                            .send_response(message.id, SET, &SetReply::Set(update))
-                            .await?;
+                        SET => {
+                            let request: SetRequest =
+                                serde_json::from_value(message.payload_as_value()?).unwrap();
+                            if request.slot == "slow" {
+                                heard.notify_one();
+                                continue;
+                            }
+                            rev += 1;
+                            let update = SlotUpdate {
+                                life: 1,
+                                slot: request.slot,
+                                rev,
+                                value: request.value,
+                            };
+                            channel
+                                .send_response(message.id, SET, &SetReply::Set(update))
+                                .await?;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         })
         .await;
-    Arc::new(server)
+    let handle = Arc::new(server)
         .listener("[::1]:0")
         .spawn()
         .await
-        .expect("偽の上流が立ち上がらない")
+        .expect("偽の上流が立ち上がらない");
+    (handle, heard_slow)
 }
 
 /// 中継が、ある Leaf の頼みで上流の返事を待っていても、ほかの Leaf は入れて、頼める
 #[tokio::test]
 async fn relay_waiting_upstream_holds_up_no_other_leaf() {
-    let upstream = start_stalling_upstream().await;
+    let (upstream, heard_slow) = start_stalling_upstream().await;
     let slave = within(
         "上流に入る",
         FieldSlave::join(upstream.local_addr(), &mako_studio()),
@@ -937,8 +948,8 @@ async fn relay_waiting_upstream_holds_up_no_other_leaf() {
         let stuck = stuck.clone();
         async move { stuck.set("slow", json!(1)).await }
     });
-    // 頼みが中継に届き、上流の返事を待ち始めるまで
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 頼みが中継を経て上流に届き、中継が上流の返事を待ち始めるまで
+    within("頼みが上流に届く", heard_slow.notified()).await;
     assert!(!slow.is_finished());
 
     let other = join(&relay_server, &mako_studio()).await;
@@ -947,6 +958,11 @@ async fn relay_waiting_upstream_holds_up_no_other_leaf() {
         .unwrap();
     assert_eq!((fast.rev, &fast.value), (1, &json!(2)));
     assert!(!slow.is_finished());
+    // 偽の上流は空の要素名でも確定させる。断られるのは、中継が上流へ運ぶ前に断るから
+    assert_eq!(
+        other.set("", json!(1)).await,
+        Err(SyncError::Refused("bad_request".into()))
+    );
 
     // 中継が止まると、返事を待っていた頼みも終わる（上流の時間切れを待たない）
     relay.stop().await;

@@ -48,7 +48,8 @@ protocol "field" version="0.1.0" {
                 field "rev" type="int"
                 field "value" type="json"
                 // 確定しなかった理由: "not_joined" | "stopped" | "bad_request" |
-                // "unreachable"（中継が上流に届けられなかった。確定したかは分からず、確定していれば feed で届く）
+                // "unreachable"（中継が上流に届けられなかった。確定したかは分からず、確定していれば feed で届く）。
+                // 中継の上流が頼みの途中で切れたときは "stopped" が返ることがあり、このときも確定したかは分からない
                 field "error" type="string"
             }
         }
