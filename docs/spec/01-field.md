@@ -1,7 +1,8 @@
 # CC-SPEC-001 — field（U1: 自分の field を持つ ／ 正本と写しの自動同期）
 
 - 状態: 草案（2026-11-21）。U1 の範囲は実装済み（2026-11-22）。
-  正本と写し（Origin と Slave）の自動同期に作り替えた（2026-11-23、設計は [`docs/design/01-field-program.md`](../design/01-field-program.md)）
+  正本と写し（Origin と Slave）の自動同期に作り替えた（2026-11-23、設計は [`docs/design/01-field-program.md`](../design/01-field-program.md)）。
+  QUIC の中継（`field relay`）を実装した（2026-11-23）
 - モデル: [`docs/model/field.qnt`](../model/field.qnt)
 - 経緯と原文: creo `chronista-club` / `mem_1ChEoNp4mDRD85MRbVj698`（U1）、
   `mem_1ChKAmAsyve89yvS2Jhho3`（自動同期の裁定）、`mem_1ChKB8rH9S1zReAmGwrDNV`（中継）、
@@ -280,4 +281,7 @@ bunx @informalsystems/quint@0.33.1 run  docs/model/field.qnt --main=streamLatest
 
 何を置くか（要素の種類と中身の形）、クライアントと描画、Ladyland との接続、音、カメラ、
 認可（誰が置き換えを頼めるか）、住所（`/@handle`）、クラウドの置き場、記録、
-QUIC で下流の Slave を待ち受ける中継のプロセス。
+どの中継に入るかの案内とつなぎ替え。
+
+QUIC で下流の Slave を待ち受ける中継のプロセス（`field relay`）は、2026-11-23 に実装した
+（[設計](../design/01-field-program.md) の D22〜D26）。振る舞いは上の「中継」のとおりで、この spec の決め事は変えていない。

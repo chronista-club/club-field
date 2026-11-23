@@ -8,6 +8,10 @@
 //
 // 「出ていく」という操作は無い。presence を閉じることが、出ていくこと。
 // field が止まると、field の側から feed と presence が閉じられる。
+//
+// 中継（field relay）も、同じプロトコルで下流を待ち受ける。下流から見ると field に入るのと同じ。
+// 名札と代は field のもの、rev は Origin が振ったまま。Set は中継を経て Origin で確定する。
+// 中継か、その上流が止まると、中継の側から feed と presence が閉じられる。
 
 protocol "field" version="0.1.0" {
     namespace "club.chronista.field"
@@ -43,7 +47,9 @@ protocol "field" version="0.1.0" {
                 field "slot" type="string"
                 field "rev" type="int"
                 field "value" type="json"
-                // 確定しなかった理由: "not_joined" | "stopped" | "bad_request"
+                // 確定しなかった理由: "not_joined" | "stopped" | "bad_request" |
+                // "unreachable"（中継が上流に届けられなかった。確定したかは分からず、確定していれば feed で届く）。
+                // 中継の上流が頼みの途中で切れたときは "stopped" が返ることがあり、このときも確定したかは分からない
                 field "error" type="string"
             }
         }

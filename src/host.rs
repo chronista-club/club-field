@@ -2,11 +2,16 @@
 //!
 //! 手元では field を 1 つ、クラウドでは複数のユーザの field を、同じ入れ物で動かす。
 //! モデルの `registry` に当たる。
+//!
+//! field（正本）と並べて、中継（上流の field に入っている写し）も置ける。
+//! protocol は、どちらにも同じ道で下流を入れる。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
+use crate::client::FieldSlave;
 use crate::core::{Field, FieldKey, Place};
+use crate::relay::RelayHandle;
 use crate::runtime::{FieldHandle, spawn_field};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -15,9 +20,16 @@ pub enum HostError {
     AlreadyExists(FieldKey),
 }
 
+/// 入れ物に置いてあるもの 1 つ。field そのもの（正本）か、中継（上流の field の写し）か
+#[derive(Clone)]
+pub enum Hosted {
+    Field(FieldHandle),
+    Relay(RelayHandle),
+}
+
 #[derive(Default)]
 pub struct Host {
-    fields: Mutex<HashMap<FieldKey, FieldHandle>>,
+    entries: Mutex<HashMap<FieldKey, Hosted>>,
 }
 
 impl Host {
@@ -27,36 +39,56 @@ impl Host {
 
     /// 持つ: field を作って動かし始める
     pub fn create(&self, key: FieldKey, place: Place, life: u64) -> Result<FieldHandle, HostError> {
-        let mut fields = self.fields.lock().expect("fields の lock が壊れている");
-        if fields.contains_key(&key) {
+        let mut entries = self.lock();
+        if entries.contains_key(&key) {
             return Err(HostError::AlreadyExists(key));
         }
         let handle = spawn_field(Field::new(key.clone(), place, life));
-        fields.insert(key, handle.clone());
+        entries.insert(key, Hosted::Field(handle.clone()));
         Ok(handle)
     }
 
-    /// 鍵から field を引く
-    pub fn get(&self, key: &FieldKey) -> Option<FieldHandle> {
-        self.fields
-            .lock()
-            .expect("fields の lock が壊れている")
-            .get(key)
-            .cloned()
+    /// 中継する: 上流の field に入っている写しを預かり、同じ鍵（上流の持ち主 + 名前）で下流を入れる
+    pub fn relay(&self, slave: FieldSlave) -> Result<RelayHandle, HostError> {
+        self.add_relay(RelayHandle::new(slave))
     }
 
-    /// ある持ち主の field の鍵（名前順）
+    pub(crate) fn add_relay(&self, relay: RelayHandle) -> Result<RelayHandle, HostError> {
+        let mut entries = self.lock();
+        if entries.contains_key(relay.key()) {
+            return Err(HostError::AlreadyExists(relay.key().clone()));
+        }
+        entries.insert(relay.key().clone(), Hosted::Relay(relay.clone()));
+        Ok(relay)
+    }
+
+    /// 鍵から field（正本）を引く。中継は引かない
+    pub fn get(&self, key: &FieldKey) -> Option<FieldHandle> {
+        match self.find(key)? {
+            Hosted::Field(field) => Some(field),
+            Hosted::Relay(_) => None,
+        }
+    }
+
+    /// 鍵から、置いてあるもの（field か中継）を引く
+    pub fn find(&self, key: &FieldKey) -> Option<Hosted> {
+        self.lock().get(key).cloned()
+    }
+
+    /// ある持ち主の、置いてあるもの（field と中継）の鍵（名前順）
     pub fn fields_of(&self, owner: &str) -> Vec<FieldKey> {
         let mut keys: Vec<FieldKey> = self
-            .fields
             .lock()
-            .expect("fields の lock が壊れている")
             .keys()
             .filter(|key| key.owner == owner)
             .cloned()
             .collect();
         keys.sort();
         keys
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<FieldKey, Hosted>> {
+        self.entries.lock().expect("入れ物の lock が壊れている")
     }
 }
 
@@ -136,5 +168,52 @@ mod tests {
     async fn join_missing_field_fails() {
         let host = Host::new();
         assert!(host.get(&mako_studio()).is_none());
+        assert!(host.find(&mako_studio()).is_none());
+    }
+
+    /// 同じプロセスの Origin に入っている Slave を、中継として預かる
+    fn relay_of(origin: &crate::sync::Origin, key: &FieldKey) -> RelayHandle {
+        let info = crate::core::FieldInfo {
+            owner: key.owner.clone(),
+            name: key.name.clone(),
+            place: Place::Local,
+            life: origin.life(),
+        };
+        RelayHandle::hold(info, crate::sync::Slave::follow(origin), None)
+    }
+
+    #[tokio::test]
+    async fn relay_sits_beside_fields() {
+        let host = Host::new();
+        host.create(mako_live(), Place::Cloud, 1).unwrap();
+        let origin = crate::sync::Origin::new(1);
+        // 中継は、上流の field と同じ鍵で置かれる
+        let relay = host.add_relay(relay_of(&origin, &mako_studio())).unwrap();
+        assert_eq!(relay.key(), &mako_studio());
+        assert!(matches!(host.find(&mako_studio()), Some(Hosted::Relay(_))));
+        assert!(matches!(host.find(&mako_live()), Some(Hosted::Field(_))));
+        // get は field（正本）だけを引く
+        assert!(host.get(&mako_studio()).is_none());
+        assert_eq!(host.fields_of("mako"), [mako_live(), mako_studio()]);
+    }
+
+    #[tokio::test]
+    async fn relay_and_field_cannot_share_a_key() {
+        let host = Host::new();
+        let origin = crate::sync::Origin::new(1);
+        host.create(mako_studio(), Place::Local, 1).unwrap();
+        assert_eq!(
+            host.add_relay(relay_of(&origin, &mako_studio())).err(),
+            Some(HostError::AlreadyExists(mako_studio()))
+        );
+        host.add_relay(relay_of(&origin, &waki_studio())).unwrap();
+        assert_eq!(
+            host.add_relay(relay_of(&origin, &waki_studio())).err(),
+            Some(HostError::AlreadyExists(waki_studio()))
+        );
+        assert_eq!(
+            host.create(waki_studio(), Place::Local, 1).err(),
+            Some(HostError::AlreadyExists(waki_studio()))
+        );
     }
 }
