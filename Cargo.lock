@@ -317,6 +317,7 @@ name = "club-field"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "club-unison",
  "serde",
@@ -350,8 +351,9 @@ dependencies = [
 
 [[package]]
 name = "club-unison"
-version = "2.3.0"
-source = "git+https://github.com/chronista-club/club-unison?rev=5ce4df3f774e3f2a7a055e9b0f283b0161613801#5ce4df3f774e3f2a7a055e9b0f283b0161613801"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c335a1526bfeb2baac10bf52446e1e4fd9000ad2e9ef8caa2271faf6ed1a1e"
 dependencies = [
  "anyhow",
  "async-stream",

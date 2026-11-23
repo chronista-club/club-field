@@ -15,7 +15,7 @@ use field::protocol::{
     SetReply, SetRequest,
 };
 use field::relay::RelayHandle;
-use field::sync::{Slave, SlotState, SlotUpdate, SyncError};
+use field::sync::{FeedAcceptor, Slave, SlotState, SlotUpdate, SyncError, proto};
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -24,7 +24,7 @@ fn mako_studio() -> FieldKey {
 }
 
 fn state(rev: u64, value: Value) -> SlotState {
-    SlotState { rev, value }
+    SlotState::from_json(rev, &value)
 }
 
 async fn start() -> (Arc<Host>, FieldServer) {
@@ -92,12 +92,7 @@ async fn origin_set_reaches_slave() {
     field.set("camera", json!("wide")).await.unwrap();
     assert_eq!(
         within("変動", slave.changed()).await,
-        Some(vec![SlotUpdate {
-            life: 1,
-            slot: "camera".into(),
-            rev: 1,
-            value: json!("wide"),
-        }])
+        Some(vec![SlotUpdate::from_json(1, "camera", 1, &json!("wide"))])
     );
     assert_eq!(slave.get("camera"), Some(state(1, json!("wide"))));
 
@@ -112,7 +107,7 @@ async fn slave_set_is_confirmed_by_origin_and_reaches_others() {
     let mut other = join(&server, &mako_studio()).await;
 
     let confirmed = within("頼む", writer.set("light", json!(2))).await.unwrap();
-    assert_eq!((confirmed.rev, &confirmed.value), (1, &json!(2)));
+    assert_eq!((confirmed.rev, confirmed.value()), (1, json!(2)));
     // 頼んだ側は、変動の知らせを待たずに確定した値を持つ
     assert_eq!(writer.get("light"), Some(state(1, json!(2))));
     // 正本（Origin）で確定している
@@ -191,12 +186,7 @@ async fn slow_consumer_slave_is_always_current() {
     // 利用者が見に来たときには、畳まれた最新の 1 つだけ
     assert_eq!(
         within("変動", slave.changed()).await,
-        Some(vec![SlotUpdate {
-            life: 1,
-            slot: "light".into(),
-            rev: 200,
-            value: json!(200),
-        }])
+        Some(vec![SlotUpdate::from_json(1, "light", 200, &json!(200))])
     );
 
     server.shutdown().await;
@@ -375,13 +365,7 @@ async fn set_without_join_is_refused() {
     let channel = within("開く", client.open_channel(PRESENCE)).await.unwrap();
     let reply: SetReply = within(
         "頼む",
-        channel.request(
-            SET,
-            &SetRequest {
-                slot: "light".into(),
-                value: json!(1),
-            },
-        ),
+        channel.request(SET, &SetRequest::from_json("light", &json!(1))),
     )
     .await
     .unwrap();
@@ -494,13 +478,7 @@ async fn client_without_feed_is_dropped() {
     // presence も閉じているので、頼みは届かない
     let after: Result<SetReply, _> = within(
         "頼む",
-        channel.request(
-            SET,
-            &SetRequest {
-                slot: "light".into(),
-                value: json!(-1),
-            },
-        ),
+        channel.request(SET, &SetRequest::from_json("light", &json!(-1))),
     )
     .await;
     assert!(after.is_err(), "{after:?}");
@@ -636,7 +614,7 @@ async fn leaf_set_through_relay_reaches_everyone() {
     let confirmed = within("中継を経て頼む", writer.set("light", json!(2)))
         .await
         .unwrap();
-    assert_eq!((confirmed.rev, &confirmed.value), (1, &json!(2)));
+    assert_eq!((confirmed.rev, confirmed.value()), (1, json!(2)));
     // Origin で確定し、応答の道で中継にも頼んだ人にも合流している
     assert_eq!(
         field.status().await.unwrap().snapshot.slots.get("light"),
@@ -905,12 +883,8 @@ async fn start_stalling_upstream() -> (
                                 continue;
                             }
                             rev += 1;
-                            let update = SlotUpdate {
-                                life: 1,
-                                slot: request.slot,
-                                rev,
-                                value: request.value,
-                            };
+                            let update =
+                                SlotUpdate::from_bytes(1, request.slot, rev, request.payload);
                             channel
                                 .send_response(message.id, SET, &SetReply::Set(update))
                                 .await?;
@@ -956,7 +930,7 @@ async fn relay_waiting_upstream_holds_up_no_other_leaf() {
     let fast = within("ほかの Leaf の頼み", other.set("fast", json!(2)))
         .await
         .unwrap();
-    assert_eq!((fast.rev, &fast.value), (1, &json!(2)));
+    assert_eq!((fast.rev, fast.value()), (1, json!(2)));
     assert!(!slow.is_finished());
     // 偽の上流は空の要素名でも確定させる。断られるのは、中継が上流へ運ぶ前に断るから
     assert_eq!(
@@ -971,4 +945,159 @@ async fn relay_waiting_upstream_holds_up_no_other_leaf() {
 
     relay_server.shutdown().await;
     let _ = upstream.shutdown().await;
+}
+
+// ── 値のバイト列 ─────────────────────────────────────────
+
+/// JSON でないバイト列（protobuf の varint の形）
+const RAW: &[u8] = &[0x08, 0x96, 0x01];
+
+/// protobuf の値の例。unison の wire の型（SlotEntryProto）を借りる
+fn mesh_message() -> proto::SlotEntryProto {
+    proto::SlotEntryProto {
+        slot: "inner".into(),
+        rev: 9,
+        payload: vec![1, 2, 3],
+        ..Default::default()
+    }
+}
+
+/// 手元の Slave の要素を、protobuf として写さずに読む
+fn read_mesh(slave: &Slave) -> Option<(String, u64, Vec<u8>)> {
+    slave.with_slot("mesh", |state| {
+        let view = state
+            .decode_view::<proto::SlotEntryProtoView>()
+            .expect("protobuf として読めない");
+        (view.slot.to_string(), view.rev, view.payload.to_vec())
+    })
+}
+
+/// 持ち主が置き換えたバイト列は、feed（buffa）を通って、直に入った人にも、中継を経た人にも、そのまま届く
+#[tokio::test]
+async fn bytes_reach_slaves_through_feed_as_is() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (_relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+    let mut direct = join(&origin_server, &mako_studio()).await;
+    let mut leaf = join(&relay_server, &mako_studio()).await;
+
+    let message = SetRequest::from_proto("mesh", &mesh_message());
+    field
+        .set_bytes("mesh", message.payload.clone())
+        .await
+        .unwrap();
+    field.set_bytes("raw", RAW).await.unwrap();
+
+    for (slave, who) in [(&mut direct, "直に入った人"), (&mut leaf, "中継を経た人")] {
+        until(slave, who, |slave| {
+            slave.get("mesh").is_some() && slave.get("raw").is_some()
+        })
+        .await;
+        assert_eq!(
+            slave.get("mesh"),
+            Some(SlotState::from_bytes(1, message.payload.clone())),
+            "{who}"
+        );
+        assert_eq!(
+            slave.get("raw"),
+            Some(SlotState::from_bytes(1, RAW)),
+            "{who}"
+        );
+        assert_eq!(
+            read_mesh(slave),
+            Some(("inner".to_string(), 9, vec![1, 2, 3])),
+            "{who}"
+        );
+    }
+
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+/// JSON の値で置き換えたもの（`set(Value)` が作る、詰めた JSON）は、presence（JSON の道）を通っても
+/// 同じバイト列に戻る。後から入った人の写しも、頼んだ人の応答も、正本とバイト単位で同じ（設計の D18）
+#[tokio::test]
+async fn json_values_keep_bytes_through_presence() {
+    let (host, server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let value = json!({ "b": 1, "a": [1.5, "x", null], "c": { "z": true, "y": -2 } });
+    field.set("scene", value.clone()).await.unwrap();
+
+    // 後から入った人は、Join の応答（JSON）で受け取る
+    let late = join(&server, &mako_studio()).await;
+    let origin = || async { field.status().await.unwrap().snapshot.slots["scene"].clone() };
+    assert_eq!(late.get("scene"), Some(origin().await));
+
+    // 入った人が頼むと、Set（JSON）で運ばれ、応答（JSON）で戻る
+    let confirmed = within("頼む", late.set("scene", value.clone()))
+        .await
+        .unwrap();
+    assert_eq!(confirmed.rev, 2);
+    assert_eq!(&confirmed.payload, origin().await.bytes());
+    assert_eq!(late.get("scene"), Some(origin().await));
+
+    server.shutdown().await;
+}
+
+/// presence の `Set` を buffa の形（`SetRequestProto`）で送る。
+/// field の presence は JSON の channel なので、組み立て済みのバイト列をそのまま載せる
+struct ProtoSet(Vec<u8>);
+
+impl unison::codec::Encodable<unison::codec::JsonCodec> for ProtoSet {
+    fn encode(&self) -> Result<Vec<u8>, unison::codec::CodecError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// presence に buffa の形で届いた `Set` の値は、JSON に戻されず、そのバイト列のまま正本になる
+#[tokio::test]
+async fn proto_set_on_presence_keeps_bytes() {
+    let (host, server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let mut other = join(&server, &mako_studio()).await;
+
+    let client = unison::ProtocolClient::insecure_localhost().unwrap();
+    // feed の受け口を置いておく（受け取れないと、field は feed に書けず presence を閉じる）
+    let feed = FeedAcceptor::register(&client, FEED).await;
+    within("つなぐ", client.connect(&server.local_addr().to_string()))
+        .await
+        .unwrap();
+    let channel = within("開く", client.open_channel(PRESENCE)).await.unwrap();
+    let joined: JoinReply = within(
+        "入る",
+        channel.request(
+            JOIN,
+            &JoinRequest {
+                owner: "mako".into(),
+                name: "studio".into(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(joined, JoinReply::Joined(_)), "{joined:?}");
+    let _feed = feed.wait(PATIENCE).await.expect("feed が開かれない");
+
+    let request = SetRequest::from_bytes("raw", RAW);
+    let wire =
+        <SetRequest as unison::codec::Encodable<unison::codec::ProtoCodec>>::encode(&request)
+            .unwrap();
+    let reply: SetReply = within("頼む", channel.request(SET, &ProtoSet(wire)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&reply, SetReply::Set(update) if update.rev == 1),
+        "{reply:?}"
+    );
+    // 正本は、送ったバイト列そのもの
+    assert_eq!(
+        field.status().await.unwrap().snapshot.slots.get("raw"),
+        Some(&SlotState::from_bytes(1, RAW))
+    );
+    // ほかに入っている人にも、feed でそのまま届く
+    until(&mut other, "feed", |slave| slave.get("raw").is_some()).await;
+    assert_eq!(other.get("raw"), Some(SlotState::from_bytes(1, RAW)));
+
+    let _ = client.disconnect().await;
+    server.shutdown().await;
 }

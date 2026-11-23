@@ -167,7 +167,7 @@ fn parse_value(text: &str) -> Value {
 }
 
 fn show(update: &SlotUpdate) -> String {
-    format!("{} = {}（rev {}）", update.slot, update.value, update.rev)
+    format!("{} = {}（rev {}）", update.slot, update.value(), update.rev)
 }
 
 /// 待ち受け先は loopback だけ（認可がまだ無いので）
@@ -232,7 +232,7 @@ async fn up(
         .snapshot
         .slots
     {
-        println!("  {slot} = {}（rev {}）", state.value, state.rev);
+        println!("  {slot} = {}（rev {}）", state.value(), state.rev);
     }
     println!("要素を置き換えるには `<要素> <値>` を入力。止めるには Ctrl-C");
 
@@ -302,7 +302,7 @@ async fn relay(key: FieldKey, connect: SocketAddr, listen: SocketAddr) -> anyhow
     // 中継の手元の状態と、以後の変動（上流から届いたものも、下流の頼みで確定したものも）を表示する
     let changes = relay.observe();
     for (slot, state) in relay.snapshot().map(|s| s.slots).unwrap_or_default() {
-        println!("  {slot} = {}（rev {}）", state.value, state.rev);
+        println!("  {slot} = {}（rev {}）", state.value(), state.rev);
     }
     println!("止めるには Ctrl-C");
 
@@ -336,7 +336,7 @@ async fn watch(key: FieldKey, connect: SocketAddr) -> anyhow::Result<()> {
         info.owner, info.name, info.place, info.life
     );
     for (slot, state) in slave.snapshot().slots {
-        println!("  {slot} = {}（rev {}）", state.value, state.rev);
+        println!("  {slot} = {}（rev {}）", state.value(), state.rev);
     }
     loop {
         tokio::select! {

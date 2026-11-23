@@ -39,6 +39,9 @@ protocol "field" version="0.1.0" {
 
         // 置き換えを頼む。field（Origin）が、その要素の rev を 1 つ進めて確定する。
         // 応答は確定した変動。同じ変動は、入っている全員（頼んだ人も）に feed でも届く
+        // field は buffa の形（unison::sync::proto::SetRequestProto、value は payload のバイト列）も受け取る。
+        // field に直接入っているときは、そのバイト列のまま確定する。中継は上流へ JSON で運ぶので、
+        // JSON でない値は化けて確定する。応答は JSON
         request "Set" description="Ask the field to replace one slot. The field confirms it with the next rev." {
             field "slot" type="string" required=#true
             field "value" type="json" required=#true
@@ -58,7 +61,9 @@ protocol "field" version="0.1.0" {
     channel "feed" from="server" lifetime="persistent" {
         // field → 入っている人。要素 1 つの変動。
         // 受け取りが遅いと、同じ要素の途中の rev は飛ばされ、最新の値だけが届く。
-        // 受け取る側は、同じ代で、手元より新しい rev だけを受け入れる
+        // 受け取る側は、同じ代で、手元より新しい rev だけを受け入れる。
+        // wire 上は buffa（club-unison の unison::sync::proto::SlotUpdateProto）で、
+        // value は payload（値のバイト列。中身は変えない）として運ばれる。受け取る側は JSON の形も読める
         event "Update" {
             field "life" type="int" required=#true
             field "slot" type="string" required=#true
