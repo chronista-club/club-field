@@ -66,8 +66,10 @@ docs/model/check.sh     # モデルの検査（Quint。bun が要る。3 分ほ�
 
 | 層 | ファイル | 役割 |
 |---|---|---|
-| 同期（汎用） | `src/sync.rs` | Origin ↔ Slave の同期。field を知らない。将来 club-unison の側へ移す |
-| field | `src/core.rs` ほか | 名札（持ち主・名前・場所）、入る・出ていく・止まる、中継（`src/relay.rs`）、QUIC の入口 |
+| 同期（汎用） | [club-unison](https://github.com/chronista-club/club-unison) の `unison::sync` | Origin ↔ Slave の同期、QUIC の運び方、中継。field を知らない。field からは `field::sync` の名で見える |
+| field | `src/core.rs` ほか | 名札（持ち主・名前・場所）、入る・出ていく・止まる、中継に名札を付ける（`src/relay.rs`）、QUIC の入口 |
+
+`unison::sync` は、いまは club-unison の nightly にだけある。crates.io の版に入るまで、`Cargo.toml` で git の rev に固定している。
 
 ## ライセンス
 

@@ -1,7 +1,8 @@
 # CC-DESIGN-001 — field プログラム
 
 - 状態: 実装済み（2026-11-22、U1 の範囲）。正本と写し（Origin と Slave）の自動同期に作り替えた（2026-11-23）。
-  QUIC で下流を待ち受ける中継（`field relay`）を足した（2026-11-23）
+  QUIC で下流を待ち受ける中継（`field relay`）を足した（2026-11-23）。
+  汎用の同期の層（同期のコア・QUIC の運び方・中継）を club-unison の `unison::sync` へ移し、field はそれを使う形にした（2026-11-23）
 - 仕様: [`docs/spec/01-field.md`](../spec/01-field.md)
 - モデル: [`docs/model/field.qnt`](../model/field.qnt)
 - コード: このレポ（`src/`、`schemas/`、`tests/`）
@@ -49,30 +50,35 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 │  main      引数を読む。up / relay / watch / set                   │
 │  host      field と中継の入れ物。鍵（持ち主 + 名前）で引く            │
 │  runtime   1 field = 1 タスク。入る・出ていく・置き換える・止まる       │
-│  relay     中継。上流に入っている写しを預かり、下流への配り手にする     │
+│  relay     中継（unison の Relay）に、上流の field の名札を付ける       │
 │  core      field そのもの。名札と、入っている人。IO なし               │
-│  protocol  入口。KDL のスキーマ + unison の channel（presence / feed） │
-│  client    入って、手元に Slave を持つ。feed を裏で吸い上げる           │
-├───────────────────────────────────────────────────────────────┤
-│  sync      Origin ↔ Slave の同期。field を知らない汎用の部品           │
-│            （将来 club-unison の側へそのまま移せる境界）               │
+│  protocol  入口。KDL のスキーマ。Join に名札を載せ、残りは unison の部品 │
+│  client    入って、手元に Slave を持つ（unison の ConnectedSlave）      │
+└───────────────────────────────────────────────────────────────┘
+         │ 使う
+┌─ club-unison（unison::sync。field では field::sync の名で見える）─────┐
+│  同期のコア  Slots・Origin・Subscription・Slave・Inlet・Upstream・Source │
+│  中継        Relay・RelayPresence                                  │
+│  運び方      配る側: FeedSource・spawn_feed・parse_set_request・      │
+│              into_set_reply・SetRequest / SetReply・JOIN / SET / UPDATE │
+│              入る側: FeedAcceptor・ConnectedSlave・JoinError          │
 └───────────────────────────────────────────────────────────────┘
          ▲ QUIC（club-unison。presence は入る人が、feed は field が開く stream）
 ```
 
 | 部品 | ファイル | 役割 | IO |
 |---|---|---|---|
-| sync | `src/sync.rs` | 要素ごとの `(rev, value)`。Origin・Slave・購読・中継 | なし（tokio の同期の道具だけ） |
+| sync | club-unison の `unison::sync`（`src/lib.rs` で `pub use unison::sync;`） | 要素ごとの `(rev, value)`。Origin・Slave・購読・中継・QUIC の運び方の部品 | 運び方の部品がネットワークを使う |
 | core | `src/core.rs` | field の名札・入っている人・動いているか。要素は中の Origin | なし |
 | runtime | `src/runtime.rs` | field を 1 タスクで動かす | なし |
-| relay | `src/relay.rs` | 中継。上流に入っている写し（`FieldSlave`）を預かり、下流が入る・頼むに応える | なし（預かった写しの上流への口が、ネットワークを使う） |
+| relay | `src/relay.rs` | 中継（`unison::sync::Relay`）に上流の field の名札を付け、`Host` で鍵から引けるようにする | なし（預かった写しの上流への口が、ネットワークを使う） |
 | host | `src/host.rs` | field と中継の入れ物 | なし |
-| protocol | `src/protocol.rs`、`schemas/field.kdl` | `Join` / `Set` と `Update` の受け答え。field にも中継にも同じ道で入れる | ネットワーク |
-| client | `src/client.rs` | 入って Slave を持つクライアント | ネットワーク |
+| protocol | `src/protocol.rs`、`schemas/field.kdl` | `Join`（名札で入る先を引き、名札の付いた状態を返す）。`Set` と `Update` は unison の部品で受け答えする。field にも中継にも同じ道で入れる | ネットワーク |
+| client | `src/client.rs` | 名札で入り、手元に `ConnectedSlave` を持つクライアント | ネットワーク |
 | main | `src/main.rs` | `field up` / `field relay` / `field watch` / `field set` | 引数、端末 |
 
-`sync` は field の語彙（持ち主・名前・場所・`FieldKey`）を一切使わない。field の側から `sync` を使い、
-`sync` から field の側は使わない。
+`sync`（`unison::sync`）は field の語彙（持ち主・名前・場所・`FieldKey`）を一切使わない。field の側から `sync` を使い、
+`sync` から field の側は使わない。field の中では、これまでどおり `crate::sync` / `field::sync` の名で見える。
 
 ## 決めたこと
 
@@ -94,7 +100,7 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 | D14 | 道を 2 本に分ける | `presence`（入る人が開く。`Join` / `Set`）と `feed`（field が開く。`Update`） | 入る人が開く channel の event は、受け取る側の待ち行列（256 件）が満ちると黙って捨てられる（club-unison の `UnisonChannel`）。field が開く stream は受け取る側が直接読むので、取りこぼさず、遅ければ QUIC の流量制御が送る側を待たせる |
 | D15 | Slave の合流の決まり | 同じ代で、手元より新しい rev だけを受け入れる（`Slots::merge`） | 道がいくつあっても（応答、要素ごとの stream、中継）合流する。モデルの反例 2・4・5 を防ぐ |
 | D16 | 頼んだ人は応答でも合流させる | `Slave::set` は、確定した変動を応答で受け取り、手元にも合流させてから返る | 頼んだ側は、`set` が返った時点で確定した値を持つ（知らせを待たない）。知らせと順番が入れ替わっても D15 で戻らない |
-| D17 | 同期を汎用の部品に分ける | `src/sync.rs`。field の語彙を使わない | 裁定 13。将来 club-unison の側（`club-unison-remote` など）へそのまま移す |
+| D17 | 同期を汎用の部品に分ける | club-unison の `unison::sync`（PR #138、`5ce4df3`）。field の語彙を使わない。field の側には残さない（`src/sync.rs` は消し、`pub use unison::sync;` の 1 行にした） | 裁定 13。field で先に作って確かめた `src/sync.rs` と運び方・中継を、club-unison の側へそのまま移した。同じものを 2 か所に持たない |
 | D18 | 値の形 | JSON（`serde_json::Value`） | 中身の形（U2）がまだ決まっていない。unison の既定の codec も JSON |
 | D19 | 要素の名前 | 空でなければ自由。空は断る（`bad_request`） | 中身の形と一緒に決める |
 | D20 | 中継の形 | `Origin` も `Slave` も `Source`（購読と、頼みの行き先）になる。`Slave::follow(&source)` で下流の Slave を作る | Slave も Origin と同じ形の状態を持つので、配り方も同じでよい。rev は Origin が振ったまま運ぶ |
@@ -104,11 +110,15 @@ cargo run -- set   --owner mako --name studio --connect '[::1]:7882' light 0.8  
 | D24 | 中継が断る頼み | 空の要素名は、上流へ運ぶ前に断る（`bad_request`）。上流が断った理由はそのまま返す。上流に届かなかった頼みは `unreachable` | 無駄に上流まで往復しない。何段重ねても、断る理由は Origin のものが届く。`unreachable` は確定したかどうか分からない（確定していれば feed で届く）ので、`stopped` と分けた。ただし、頼みの途中で中継の上流へのつながりが切れると、D25 で `stopped` が返ることがある（このときも、確定したかは分からない。直後に下流は外される） |
 | D25 | 外れたら、返事を待っている頼みも終わる | `Slave::set`（`sync::Link`）は、上流の返事を待つ間に Slave が上流から外れたら、待つのをやめて `Closed` を返す。待つのは「閉じた」だけの知らせで、変動の知らせとは分ける | unison の `UnisonChannel::close` は返事待ちの request を解かず、request の時間切れ（30 秒）まで待たせる（下の「実装して分かったこと」）。中継が止まったとき、下流の頼みを抱えたタスクを残さない。変動の知らせ（`Version`）で待つと、変動のたびに返事待ちの頼みが全部起きる（下の「実装して分かったこと」） |
 | D26 | `field relay` の待ち受け先 | `--listen` は必須（既定なし）。ポート 0 なら空いているポート。loopback だけ（D11） | 中継は上流と同じマシンで動かすことが多く、`field up` の既定（`[::1]:7880`）とはぶつかる。既定のポート自体が仮（D13）なので、仮のポートをもう 1 つ増やさない |
+| D27 | club-unison の版の決め方 | git の rev で固定する（`5ce4df3f774e3f2a7a055e9b0f283b0161613801`、40 文字） | `unison::sync` は club-unison の nightly にだけあり、crates.io の版（2.3.0）には無い。branch で指すと、知らない間に中身が変わりうる。短い SHA は、あとで曖昧になりうる |
+| D28 | field の入口の組み方 | `unison::sync` の既製の入口（`SyncServer` / `serve_sync_channel` / `SyncTarget`、`ConnectedSlave::join`）は使わない。presence の応対と `Join` は field が持ち、`Set` / `Update` / feed / 入った後の写しは unison の部品（`spawn_feed`・`parse_set_request`・`into_set_reply`、`FeedAcceptor`・`ConnectedSlave::attach`）で組む。道の名前（`presence` / `feed`）とスキーマ（`schemas/field.kdl`）は変えない | 既製の入口は「1 つの待ち受け = 配り手 1 つ」で、`Join` に中身が無く、応答は名札の無い状態。field は 1 つの待ち受けに複数の field と中継を置き（D4、D22）、`Join` の名札で入る先を引き、応答に名札を付ける。部品で組めば、下流から見た受け答え（結合テスト 23 件）は 1 つも変わらない |
 
 D1〜D5 は mako の承認（2026-11-22「ok」）。D6〜D13 は claude の案で、同じ承認のもとで進めた。
 D5〜D7 の見直し、D9、D14〜D21 は、2026-11-23 の mako の裁定（GO、「あとはrecommendでOK」）のもとで claude が決めた。
 D22〜D26 は、2026-11-23 の mako の裁定（「`field relay` を先に小さく通してから `club-unison` へ輸出」）を受けて
 lead から渡された task（`mem_1ChKHwzGspREaztdkR7CDP`）のもとで claude が決めた。
+D17 の改め、D27、D28 は、club-unison への輸出（`mem_1ChKdJTLL17QHAFpktCt6S`）を受けて lead から渡された task
+（`mem_1ChKfmFQhwDDA2TEvfuUUG`）のもとで claude が決めた。
 
 D2 と D3 は、当初 `chronista.club` レポの `field/` に置く案で承認され、そのとおり実装した。
 その後「ポータルとサーバが同居している」ことから、マージ前に別レポへ移すと mako が決め、
@@ -193,15 +203,15 @@ presence も閉じる（出ていったことになる）。`feed` を失った�
 | `Field { place, running, life, slots }` | `core::Field`（`slots` と `life` は中の `sync::Origin`） |
 | `SlotState { rev, value }` | `sync::SlotState` |
 | `isJoined` / `joined` | `core::Field::visitors` |
-| `seen`（手元の Slave） | `sync::Slave`（client では `client::FieldSlave`） |
-| `via`（中継） | `Slave::follow(&slave)` で作った下流の Slave。QUIC では、`Host::relay` に預けた `FieldSlave`（`relay::RelayHandle`）に入った下流の Slave |
+| `seen`（手元の Slave） | `sync::Slave`（client では `client::FieldSlave` の中の `sync::ConnectedSlave`） |
+| `via`（中継） | `Slave::follow(&slave)` で作った下流の Slave。QUIC では、`Host::relay` に預けた `FieldSlave`（`relay::RelayHandle` の中の `sync::Relay`）に入った下流の Slave |
 | `create` | `Host::create`（`field up`） |
 | `join` | `Join` → `FieldHandle::join` → `core::Field::join` |
 | `joinVia` | `Slave::follow(&relay)`。QUIC では、`field relay` の待ち受けに `Join` → `RelayHandle::join` |
 | `leave` | presence が閉じる → `Presence` を手放す → `core::Field::leave`。Slave を手放す → 下流の購読が終わる。中継が止まる（`RelayHandle::stop`）→ 中継の Slave を手放す |
 | `setSlot` | `FieldHandle::set`（`field up` の標準入力） |
 | `requestSet` / `commit` | `Slave::set` → `Set` → `FieldHandle::set` → `sync::Origin::set`。中継を通すときは `Set` → `RelayHandle::set` → 中継の Slave の上流への口 → `Set` → … |
-| `receive`（Feed） | client の吸い上げる係 → `Inlet::apply` → `Slots::merge` |
+| `receive`（Feed） | `ConnectedSlave` の吸い上げる係 → `Inlet::apply` → `Slots::merge` |
 | `receive`（Reply） | `Slave::set` が応答を `Slots::merge` |
 | `stop` | `FieldHandle::stop`（`field up` の Ctrl-C）→ `Origin::close` |
 | `restart` | もう一度 `field up`。代は起動時刻なので前より大きい |
@@ -212,19 +222,22 @@ presence も閉じる（出ていったことになる）。`feed` を失った�
 
 ## sync の部品
 
-| 型 | 役割 |
-|---|---|
-| `Slots` | 要素の集まり（IO なし）。`set` で確定（Origin）、`merge` で合流（Slave）、`changes_since` で「ある時点より後に変わった要素の今の値」 |
-| `Origin` | 正本。`set` / `get` / `snapshot` / `subscribe` / `close`。`subscribe` は、購読した時点の状態と購読を別々に返す |
-| `Subscription` | 購読。`next()` で、購読した時点より後に変わった要素の今の値（途中の rev は畳まれる）。状態の写しは持たない（入った人の数だけ写しを抱えないため） |
-| `Slave` | 手元の写し。`get` / `snapshot` / `changed` / `set`。手放すと上流から外れる。外れると、上流の返事を待っている `set` も `Closed` で終わる（D25） |
-| `Inlet` | 運び方の受け取り係が、届いた変動を Slave に流し込む口（`apply` / `close` / `slave_gone`） |
-| `Upstream` | 置き換えの頼みの行き先。運び方ごとに実装する（client の `QuicUpstream`、`Origin` 自身） |
-| `Source` | 配り手（`subscribe` と `upstream`）。`Origin` と `Slave` が実装する |
+同期の部品は、すべて club-unison の `unison::sync` にある（仕様 `spec/05-sync/SPEC.md`、設計 `design/sync.md`）。
+field が使うものと、その使い道:
 
-club-unison の側へ移すときは、`src/sync.rs` をそのまま移し、`protocol.rs` / `client.rs` の運び方
-（`Join` / `Set` / `Update` と feed の開き方）を、field の名札を外した汎用の channel にする。
-unison の側の構想（`mem_1CgkvMWbDW7Tne5DwRxhjD`）の「control は client 起点、feed は server 起点」と同じ形にしてある。
+| 型・関数 | 役割 | field での使い道 |
+|---|---|---|
+| `Slots` | 要素の集まり（IO なし）。`set` で確定（Origin）、`merge` で合流（Slave）、`changes_since` で「ある時点より後に変わった要素の今の値」 | （`Origin` / `Slave` の中） |
+| `Origin` | 正本。`set` / `get` / `snapshot` / `subscribe` / `close`。`subscribe` は、購読した時点の状態と購読を別々に返す。空の要素名は `Refused("bad_request")` で断る | `core::Field` の要素と代 |
+| `Subscription` | 購読。`next()` で、購読した時点より後に変わった要素の今の値（途中の rev は畳まれる）。状態の写しは持たない | `runtime::Presence`、`observe` |
+| `Slave` / `Inlet` / `Upstream` / `Source` | 手元の写しと、その流し込み口・上流への口・配り手。外れると、上流の返事を待っている `set` も `Closed` で終わる（D25） | `client::FieldSlave` が `Slave` として読める |
+| `Relay` / `RelayPresence` | 上流に入っている写しを預かり、下流への配り手にする。頼みを運ぶ間 lock を握らない（D23） | `relay::RelayHandle` の中身 |
+| `FeedSource` / `spawn_feed` | 配り手の変動を server 起点の feed へ書き続ける係。止まったら presence も閉じる | `protocol` の feed（`Presence` / `RelayPresence` を `Visit` にまとめて渡す） |
+| `parse_set_request` / `into_set_reply` / `SetRequest` / `SetReply` / `JOIN` / `SET` / `UPDATE` | `Set` の検証と応答、名前 | `protocol` の `Set`（中継が上流に届かなかったときだけは、中継の鍵をログに残すため field が応答を作る） |
+| `FeedAcceptor` / `ConnectedSlave` / `JoinError` / `FEED_PATIENCE` | 入る側: feed の受け口、入った後の写し（吸い上げる係と、同時に出す頼みの抑え。抑える数は `MAX_SETS_IN_FLIGHT`、D21） | `client`（`MAX_SETS_IN_FLIGHT` は `ConnectedSlave` の中で使われ、field からは直接使わない） |
+
+field が使わないもの: `SyncServer` / `serve_sync_channel` / `register_sync_channel` / `SyncTarget` /
+`ConnectedSlave::join` と、unison 側の `Join` の中身（`JoinRequest` / `JoinReply`）。理由は D28。
 
 ## テスト
 
@@ -234,14 +247,18 @@ cargo test
 
 | 段 | 場所 | 件数 | 内容 |
 |---|---|---|---|
-| sync | `src/sync.rs` | 27 | 合流の決まり（古い rev・同じ rev・前の代を捨てる、要素の順不同）、畳み込み、応答と知らせの入れ替わり、遅い利用者、中継（多段・下流からの頼み・中継が外れる）、外れたら返事待ちの頼みも終わる、返事待ちの頼みは変動では起きない |
 | core | `src/core.rs` | 17 | 操作ごとの振る舞い。IO なし |
 | runtime | `src/runtime.rs` | 11 | 受け取りが遅い人には最新だけが残る、戻らない、先に進まない、止まる |
-| relay | `src/relay.rs` | 7 | 中継に入る → 中継の状態と以後の変動、頼みが上流で確定して中継にも合流する、上流の返事を待つ頼みがあっても入れて頼める、出ていった人は数えない、上流が止まる・中継が止まると下流が外れる、止めると返事待ちの頼みも終わる。IO なし（同じプロセスの Origin を上流にする） |
+| relay | `src/relay.rs` | 3 | field が足したものだけ: 中継に入ると上流の field の名札が付いた状態と以後の変動が来る、上流が止まる・中継が止まると `FieldError::Stopped` で入れない。IO なし（同じプロセスの Origin を上流にする） |
 | host | `src/host.rs` | 7 | 複数の field、同名・別の持ち主、重複、中継を field と並べて置く、中継と field は同じ鍵に置けない |
+| protocol | `src/protocol.rs` | 2 | スキーマ（`schemas/field.kdl`）の名前が unison の運び方の名前（`Join` / `Set` / `Update`）と同じ、field の断りが `bad_request` / `stopped` に読み替わる |
 | 結合 | `tests/presence.rs` | 23 | 本物の QUIC。入る → 状態、Origin の変動が Slave に届く、Slave からの頼みが確定して他の Slave にも届く、何人もが入り混じって置き換えても全員が揃う、遅い利用者でも Slave は最新、QUIC の Slave を中継にする、出ていく、止まる、別々の field、断られる頼み、1 つの Slave から 3000 の頼みを一度に出しても全部確定する、feed を受け取らないクライアントは外される、入るのに失敗してもつながりが残らない。**QUIC の中継**（`Origin ──QUIC──▶ Relay ──QUIC──▶ Leaf`）: Origin の変動が Leaf に届く、Leaf の頼みが Origin で確定して中継・別の Leaf・直結の Slave に揃う、何人もが入り混じって置き換えても揃う、Leaf が出ていっても残りは動く、中継が止まるとその下流だけ外れる、Origin が止まると中継にも下流にも伝わり入れなくなる、3 段（`Origin → Relay 1 → Relay 2 → Leaf`）で上り下りが通る、上流の返事を待つ頼みがあってもほかの Leaf は入れて頼め、中継は空の要素名を上流へ運ばずに断り、中継を止めると返事待ちの頼みも終わる（`slow` にだけ返事をしない偽の上流で） |
 
-結合テストは、続けて 15 回、6 本並べて 5 回（計 30 回）回して、落ちなかった（2026-11-23、macOS）。
+同期のコアと中継そのものの振る舞い（前は `src/sync.rs` の 27 件と `src/relay.rs` の 7 件）は、club-unison の側で確かめる
+（`crates/unison-protocol/tests/test_small_sync.rs`。QUIC の運び方は `test_medium_sync.rs`）。field の側に同じテストは置かない。
+
+結合テストは、続けて 15 回と、6 本並べて 5 回（30 回）の計 45 回回して、落ちなかった（2026-11-23、macOS。
+`unison::sync` へ切り替えた後にも同じ回数を回し、落ちなかった）。
 
 ## 実装して分かったこと
 
@@ -282,7 +299,8 @@ club-unison 2.3 の `UnisonChannel::close` は、受け取り係を止めて str
 
 そこで `Slave::set` が、Slave が上流から外れた時点で待つのをやめるようにした（D25）。
 sync の `pending_set_ends_when_slave_is_closed` / `pending_relayed_set_ends_when_relay_leaves`、
-`relay::tests::stop_ends_pending_set`、結合テストの `relay_waiting_upstream_holds_up_no_other_leaf` は、
+中継の `stop_ends_pending_set`（いまは club-unison の `relay_handle_stop_ends_pending_set`）、
+結合テストの `relay_waiting_upstream_holds_up_no_other_leaf` は、
 どれも直す前は時間切れ（5 秒）で落ちた（結合テストは moody-blues のレビューで、D25 を外して確かめた）。
 結合テストで頼みを終わらせるのが、中継の側（`stopped` を返す）か、下流の側（`Closed` で終わる）かは、競争で決まる。
 中継に限らず、Origin に直接入っている Slave でも、Origin が止まったときに返事を待っていた頼みは同じように終わる。
@@ -318,7 +336,7 @@ sync の `pending_set_ends_when_slave_is_closed` / `pending_relayed_set_ends_whe
 
 | 項目 | 内容 |
 |---|---|
-| unison へ移す | `src/sync.rs` と運び方を club-unison の側（`club-unison-remote` など）へ。名前と channel 名は unison の側の構想と合わせて決める。中継（`relay.rs` と、protocol が field と中継を同じ道で配る形）も一緒に |
+| unison の版に戻す | `unison::sync` が crates.io の版に入ったら、git の rev（D27）をやめて版で指定する |
 | 中継の案内 | どの中継に入るかを案内する・中継が止まったら別の中継や Origin へつなぎ替える。住所・認可と一緒に |
 | 要素ごとの道 | 要素ごとに `feed` を分ける・優先度をつける。合流の決まり（D15）はそのまま使える |
 | 書き手と読み手 | 頼める人を絞る（演者だけが書く）。認可と一緒に |
