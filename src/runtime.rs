@@ -1,50 +1,46 @@
 //! 1 つの field を 1 つのタスクで動かす。
 //!
-//! タスクが [`Field`]（core）を持ち、一定間隔で時計を進め、入っている人へ
-//! その時点の状態を送り出す。
+//! タスクが [`Field`]（core）を持ち、入る・出ていく・置き換える・止まる、の頼みを順に受ける。
+//! 時計は無い。変動は、要素が置き換えられたときだけ起きる（変動駆動）。
 //!
 //! ## 「新しいものだけ」の作り
 //!
-//! 送り出しには `tokio::sync::watch` を使う。watch が持つのは**最新の 1 枚だけ**。
-//! 受け取りが遅い人は、途中の tick を飛ばして最新のものだけを受け取る。
-//! モデルの `streamLatest`（順番どおり・新しいものだけ）に当たる。
-//! 古いものが捨てられるのは watch の中、つまり stream へ書き込む前。
+//! 入っている人へは、[`Subscription`]（sync）で変動を渡す。購読は、前回から変わった要素の
+//! 今の値だけを返す（途中の rev は畳まれる）。受け取りが遅い人に溜まるのは要素の数まで。
+//! モデルの `streamLatest`（要素ごとに順番どおり・新しいものだけ）に当たる。
+//! 古いものが畳まれるのは購読の中、つまり stream へ書き込む前。
+//!
+//! 置き換えの頼みは、値のバイト列（[`Bytes`]）をそのままタスクへ渡す（写さない）。
 
-use std::time::Duration;
+use bytes::Bytes;
+use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
 
-use tokio::sync::{mpsc, oneshot, watch};
-
-use crate::core::{Field, FieldError, FieldKey, Snapshot, VisitorId};
-
-/// field の動かし方
-#[derive(Clone, Copy, Debug)]
-pub struct FieldConfig {
-    /// 時計の間隔
-    pub tick_interval: Duration,
-}
-
-impl Default for FieldConfig {
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_secs(1),
-        }
-    }
-}
+use crate::core::{Field, FieldError, FieldInfo, FieldKey, FieldSnapshot, VisitorId, json_payload};
+use crate::sync::{SlotUpdate, Subscription};
 
 /// ある時点の field の様子（確かめ用）
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FieldStatus {
-    pub snapshot: Snapshot,
+    pub snapshot: FieldSnapshot,
     /// 入っている人の数
     pub visitors: usize,
 }
 
 enum Command {
     Join {
-        reply: oneshot::Sender<Result<Presence, FieldError>>,
+        reply: oneshot::Sender<Result<(FieldSnapshot, Presence), FieldError>>,
     },
     Leave {
         visitor: VisitorId,
+    },
+    Set {
+        slot: String,
+        payload: Bytes,
+        reply: oneshot::Sender<Result<SlotUpdate, FieldError>>,
+    },
+    Observe {
+        reply: oneshot::Sender<Subscription>,
     },
     Status {
         reply: oneshot::Sender<FieldStatus>,
@@ -64,10 +60,9 @@ pub struct FieldHandle {
 /// field に入っている、ということ。手放す（drop する）と出ていく
 pub struct Presence {
     visitor: VisitorId,
-    /// 入った時点の状態
-    snapshot: Snapshot,
-    /// 以後の tick。持っているのは最新の 1 枚だけ
-    ticks: watch::Receiver<Snapshot>,
+    info: FieldInfo,
+    /// 入った時点より後の変動
+    updates: Subscription,
     commands: mpsc::UnboundedSender<Command>,
 }
 
@@ -76,16 +71,14 @@ impl Presence {
         self.visitor
     }
 
-    /// 入った時点の状態
-    pub fn snapshot(&self) -> &Snapshot {
-        &self.snapshot
+    pub fn info(&self) -> &FieldInfo {
+        &self.info
     }
 
-    /// 次の tick を待つ。途中の tick は飛ばし、最新のものを返す。
+    /// 次の変動を待つ。前回から変わった要素の今の値を、変わった順に返す（途中の rev は畳まれる）。
     /// field が止まったら `None`
-    pub async fn next_tick(&mut self) -> Option<Snapshot> {
-        self.ticks.changed().await.ok()?;
-        Some(self.ticks.borrow_and_update().clone())
+    pub async fn next(&mut self) -> Option<Vec<SlotUpdate>> {
+        self.updates.next().await
     }
 }
 
@@ -103,13 +96,47 @@ impl FieldHandle {
         &self.key
     }
 
-    /// 入る
-    pub async fn join(&self) -> Result<Presence, FieldError> {
+    /// 入る。入った時点の状態と、入っていること（以後の変動）を受け取る
+    pub async fn join(&self) -> Result<(FieldSnapshot, Presence), FieldError> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Join { reply })
             .map_err(|_| FieldError::Stopped)?;
         answer.await.map_err(|_| FieldError::Stopped)?
+    }
+
+    /// 置き換える: 要素の値（バイト列）を置き換えて確定する。確定した変動を返す。
+    /// 値の形の前提は [`Field::set_bytes`] と同じ（設計の D18）
+    pub async fn set_bytes(
+        &self,
+        slot: impl Into<String>,
+        payload: impl Into<Bytes>,
+    ) -> Result<SlotUpdate, FieldError> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Set {
+                slot: slot.into(),
+                payload: payload.into(),
+                reply,
+            })
+            .map_err(|_| FieldError::Stopped)?;
+        answer.await.map_err(|_| FieldError::Stopped)?
+    }
+
+    /// 置き換える: JSON の値で（[`FieldHandle::set_bytes`] の便利な入口）
+    pub async fn set(
+        &self,
+        slot: impl Into<String>,
+        value: Value,
+    ) -> Result<SlotUpdate, FieldError> {
+        self.set_bytes(slot, json_payload(&value)).await
+    }
+
+    /// 入らずに見る（持ち主の手元の表示など）。field が止まっていれば `None`
+    pub async fn observe(&self) -> Option<Subscription> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::Observe { reply }).ok()?;
+        answer.await.ok()
     }
 
     /// いまの様子。field が止まっていれば `None`
@@ -129,76 +156,73 @@ impl FieldHandle {
 }
 
 /// field を動かし始める
-pub fn spawn_field(mut field: Field, config: FieldConfig) -> FieldHandle {
+pub fn spawn_field(mut field: Field) -> FieldHandle {
     let key = field.key().clone();
     let (commands, mut inbox) = mpsc::unbounded_channel::<Command>();
-    let (notes, _) = watch::channel(field.snapshot());
     let presence_commands = commands.downgrade();
 
     tokio::spawn(async move {
         let name = field.key().clone();
         let mut next_visitor: u64 = 1;
-        // 最初の tick は 1 間隔ぶん待ってから
-        let mut clock = tokio::time::interval_at(
-            tokio::time::Instant::now() + config.tick_interval,
-            config.tick_interval,
-        );
-        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tracing::info!("field {name}: 動き始めた（{}代め）", field.life());
 
         loop {
-            tokio::select! {
-                command = inbox.recv() => match command {
-                    Some(Command::Join { reply }) => {
-                        let visitor = VisitorId(next_visitor);
-                        next_visitor += 1;
-                        // 口がもう無いなら、field は畳まれる途中
-                        let Some(commands) = presence_commands.upgrade() else {
-                            let _ = reply.send(Err(FieldError::Stopped));
-                            continue;
-                        };
-                        let answer = field.join(visitor).map(|snapshot| Presence {
+            match inbox.recv().await {
+                Some(Command::Join { reply }) => {
+                    let visitor = VisitorId(next_visitor);
+                    next_visitor += 1;
+                    // 口がもう無いなら、field は畳まれる途中
+                    let Some(commands) = presence_commands.upgrade() else {
+                        let _ = reply.send(Err(FieldError::Stopped));
+                        continue;
+                    };
+                    let info = field.info();
+                    let answer = field.join(visitor).map(|(snapshot, updates)| {
+                        let presence = Presence {
                             visitor,
-                            snapshot,
-                            // subscribe した時点の値は「見たもの」として扱われる。
-                            // 以後に届くのは、この snapshot より後の tick だけ
-                            ticks: notes.subscribe(),
+                            info,
+                            updates,
                             commands,
-                        });
-                        // 受け取る側がもういなければ、Presence はここで手放され、
-                        // その drop が「出ていく」を送ってくる
-                        let _ = reply.send(answer);
-                    }
-                    Some(Command::Leave { visitor }) => {
-                        let _ = field.leave(visitor);
-                    }
-                    Some(Command::Status { reply }) => {
-                        let _ = reply.send(FieldStatus {
-                            snapshot: field.snapshot(),
-                            visitors: field.visitors().len(),
-                        });
-                    }
-                    Some(Command::Stop { reply }) => {
-                        let _ = field.stop();
-                        let _ = reply.send(());
-                        break;
-                    }
-                    // 口が全部なくなった
-                    None => {
-                        let _ = field.stop();
-                        break;
-                    }
-                },
-                _ = clock.tick() => {
-                    if let Ok(note) = field.tick() {
-                        // 入っている人がいなくても時計は進む
-                        notes.send_replace(note);
-                    }
+                        };
+                        (snapshot, presence)
+                    });
+                    // 受け取る側がもういなければ、Presence はここで手放され、
+                    // その drop が「出ていく」を送ってくる
+                    let _ = reply.send(answer);
+                }
+                Some(Command::Leave { visitor }) => {
+                    let _ = field.leave(visitor);
+                }
+                Some(Command::Set {
+                    slot,
+                    payload,
+                    reply,
+                }) => {
+                    let _ = reply.send(field.set_bytes(&slot, payload));
+                }
+                Some(Command::Observe { reply }) => {
+                    let _ = reply.send(field.observe());
+                }
+                Some(Command::Status { reply }) => {
+                    let _ = reply.send(FieldStatus {
+                        snapshot: field.snapshot(),
+                        visitors: field.visitors().len(),
+                    });
+                }
+                Some(Command::Stop { reply }) => {
+                    let _ = field.stop();
+                    let _ = reply.send(());
+                    break;
+                }
+                // 口が全部なくなった
+                None => {
+                    let _ = field.stop();
+                    break;
                 }
             }
         }
+        // field.stop() が Origin を閉じたので、入っていた人の next は、残りを返したあとに None を返す
         tracing::info!("field {name}: 止まった");
-        // ここで notes が落ち、入っていた人の next_tick が None を返す
     });
 
     FieldHandle { key, commands }
@@ -206,116 +230,159 @@ pub fn spawn_field(mut field: Field, config: FieldConfig) -> FieldHandle {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::core::Place;
-
-    const INTERVAL: Duration = Duration::from_millis(100);
+    use crate::sync::SlotState;
 
     fn spawn() -> FieldHandle {
-        spawn_field(
-            Field::new(FieldKey::new("mako", "studio"), Place::Local, 1),
-            FieldConfig {
-                tick_interval: INTERVAL,
-            },
-        )
+        spawn_field(Field::new(FieldKey::new("mako", "studio"), Place::Local, 1))
     }
 
-    /// n 回ぶんの tick が過ぎるのを待つ（時間は止めてあるので一瞬で進む）
-    async fn pass(n: u32) {
-        tokio::time::sleep(INTERVAL * n + INTERVAL / 2).await;
+    fn update(slot: &str, rev: u64, value: Value) -> SlotUpdate {
+        SlotUpdate::from_json(1, slot, rev, &value)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn tick_advances_with_nobody() {
+    #[tokio::test]
+    async fn set_advances_with_nobody() {
         let field = spawn();
-        pass(3).await;
+        field.set("light", json!(1)).await.unwrap();
+        field.set("light", json!(2)).await.unwrap();
         let status = field.status().await.unwrap();
-        assert_eq!(status.snapshot.tick, 3);
+        assert_eq!(
+            status.snapshot.slots.get("light"),
+            Some(&SlotState::from_json(2, &json!(2)))
+        );
         assert_eq!(status.visitors, 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn join_gets_snapshot_then_ticks() {
+    #[tokio::test]
+    async fn set_bytes_reaches_visitors_without_copy() {
         let field = spawn();
-        pass(2).await;
-        let mut presence = field.join().await.unwrap();
-        assert_eq!(presence.snapshot().tick, 2);
-        assert_eq!(presence.next_tick().await.unwrap().tick, 3);
-        assert_eq!(presence.next_tick().await.unwrap().tick, 4);
+        let (_, mut presence) = field.join().await.unwrap();
+        // JSON でないバイト列（protobuf の varint の形）
+        let raw = Bytes::from_static(&[0x08, 0x96, 0x01]);
+        let confirmed = field.set_bytes("mesh", raw.clone()).await.unwrap();
+        assert_eq!(confirmed, SlotUpdate::from_bytes(1, "mesh", 1, raw.clone()));
+        assert_eq!(presence.next().await, Some(vec![confirmed]));
+        // 正本は、渡したバッファそのもの（タスクへ渡す間に写していない）
+        let status = field.status().await.unwrap();
+        assert_eq!(status.snapshot.slots["mesh"].payload.as_ptr(), raw.as_ptr());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn join_gets_snapshot_then_updates() {
+        let field = spawn();
+        field.set("light", json!(1)).await.unwrap();
+        let (snapshot, mut presence) = field.join().await.unwrap();
+        assert_eq!(snapshot.slots["light"].rev, 1);
+        assert_eq!(presence.info().owner, "mako");
+        field.set("camera", json!("wide")).await.unwrap();
+        assert_eq!(
+            presence.next().await,
+            Some(vec![update("camera", 1, json!("wide"))])
+        );
+    }
+
+    #[tokio::test]
     async fn slow_visitor_skips_to_recent() {
         let field = spawn();
-        let mut presence = field.join().await.unwrap();
-        // 受け取らないまま 5 回ぶん過ぎる
-        pass(5).await;
-        // 溜まった 1〜4 は飛ばして、最新の 5 だけが来る
-        assert_eq!(presence.next_tick().await.unwrap().tick, 5);
-        // その次は 6（古いものは残っていない）
-        assert_eq!(presence.next_tick().await.unwrap().tick, 6);
+        let (_, mut presence) = field.join().await.unwrap();
+        // 受け取らないまま 5 回置き換わる
+        for i in 1..=5 {
+            field.set("light", json!(i)).await.unwrap();
+        }
+        // 溜まった 1〜4 は畳まれて、最新の 5 だけが来る
+        assert_eq!(
+            presence.next().await,
+            Some(vec![update("light", 5, json!(5))])
+        );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn ticks_never_go_back_and_never_get_ahead() {
+    #[tokio::test]
+    async fn updates_never_go_back_and_never_get_ahead() {
         let field = spawn();
-        let mut presence = field.join().await.unwrap();
-        let mut seen = presence.snapshot().tick;
-        for _ in 0..10 {
-            let note = presence.next_tick().await.unwrap();
-            assert!(note.tick > seen, "戻った: {} → {}", seen, note.tick);
-            seen = note.tick;
-            let now = field.status().await.unwrap().snapshot.tick;
+        let (_, mut presence) = field.join().await.unwrap();
+        let mut seen = 0;
+        for i in 1..=10 {
+            field.set("light", json!(i)).await.unwrap();
+            for update in presence.next().await.unwrap() {
+                assert!(update.rev > seen, "戻った: {seen} → {}", update.rev);
+                seen = update.rev;
+            }
+            let now = field.status().await.unwrap().snapshot.slots["light"].rev;
             assert!(seen <= now, "先に進んだ: 手元 {seen}、field {now}");
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn two_visitors_both_get_ticks() {
+    #[tokio::test]
+    async fn two_visitors_both_get_updates() {
         let field = spawn();
-        let mut a = field.join().await.unwrap();
-        let mut b = field.join().await.unwrap();
+        let (_, mut a) = field.join().await.unwrap();
+        let (_, mut b) = field.join().await.unwrap();
         assert_ne!(a.visitor(), b.visitor());
         assert_eq!(field.status().await.unwrap().visitors, 2);
-        assert_eq!(a.next_tick().await.unwrap().tick, 1);
-        assert_eq!(b.next_tick().await.unwrap().tick, 1);
+        field.set("light", json!(1)).await.unwrap();
+        assert_eq!(a.next().await, Some(vec![update("light", 1, json!(1))]));
+        assert_eq!(b.next().await, Some(vec![update("light", 1, json!(1))]));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn observe_is_not_a_visitor() {
+        let field = spawn();
+        let mut watching = field.observe().await.unwrap();
+        assert_eq!(field.status().await.unwrap().visitors, 0);
+        field.set("light", json!(1)).await.unwrap();
+        assert_eq!(
+            watching.next().await,
+            Some(vec![update("light", 1, json!(1))])
+        );
+    }
+
+    #[tokio::test]
     async fn leave_stops_delivery() {
         let field = spawn();
-        let presence = field.join().await.unwrap();
+        let (_, presence) = field.join().await.unwrap();
         assert_eq!(field.status().await.unwrap().visitors, 1);
         drop(presence);
         assert_eq!(field.status().await.unwrap().visitors, 0);
         // field は動き続ける
-        pass(2).await;
-        assert_eq!(field.status().await.unwrap().snapshot.tick, 2);
+        assert!(field.set("light", json!(1)).await.is_ok());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stop_drops_everyone() {
         let field = spawn();
-        let mut presence = field.join().await.unwrap();
+        let (_, mut presence) = field.join().await.unwrap();
         field.stop().await;
         // 入っていた人には「止まった」が伝わる
-        assert_eq!(presence.next_tick().await, None);
+        assert_eq!(presence.next().await, None);
         assert!(field.status().await.is_none());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn cannot_join_stopped() {
         let field = spawn();
         field.stop().await;
         assert!(matches!(field.join().await, Err(FieldError::Stopped)));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn cannot_set_stopped() {
+        let field = spawn();
+        field.stop().await;
+        assert_eq!(field.set("light", json!(1)).await, Err(FieldError::Stopped));
+    }
+
+    #[tokio::test]
     async fn stops_when_every_handle_is_gone() {
         let field = spawn();
-        let mut presence = field.join().await.unwrap();
+        let mut watching = field.observe().await.unwrap();
+        let (_, presence) = field.join().await.unwrap();
         drop(field);
-        // Presence も口を 1 つ持っているので、まだ動いている
-        assert_eq!(presence.next_tick().await.unwrap().tick, 1);
+        // Presence も口を 1 つ持っているので、まだ止まらない。それも手放すと止まる
+        drop(presence);
+        assert_eq!(watching.next().await, None);
     }
 }
