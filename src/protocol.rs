@@ -12,6 +12,12 @@
 //! 購読（sync）が要素ごとに最新の値へ畳む。
 //!
 //! field が止まったら、こちらから feed と presence を閉じる。
+//!
+//! 待ち受けるのは、[`Host`] に置いてあるもの（field そのもの、または中継）。
+//! 中継（[`RelayHandle`]）に入る人にも、同じ道で同じ受け答えをする。
+//! presence は 1 本ごとに別のタスクで応対する。中継が、ある人の頼みで上流の返事を待っていても、
+//! ほかの人の `Join` / `Set` は待たされない。1 本の presence の中では、頼みを届いた順に 1 つずつ運ぶ
+//! （1 人の頼みの順番を保つ）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,9 +30,10 @@ use unison::network::server::ServerHandle;
 use unison::network::{MessageType, NetworkError, ProtocolMessage, UnisonChannel, UnisonStream};
 
 use crate::core::{FieldError, FieldKey, FieldSnapshot};
-use crate::host::Host;
+use crate::host::{Host, Hosted};
+use crate::relay::{RelayHandle, RelayPresence};
 use crate::runtime::{FieldHandle, Presence};
-use crate::sync::SlotUpdate;
+use crate::sync::{SlotUpdate, SyncError};
 
 /// スキーマの正本はファイル。ビルドに焼き込み、discovery で配る
 pub const FIELD_KDL: &str = include_str!("../schemas/field.kdl");
@@ -105,9 +112,25 @@ impl FieldServer {
 
 /// 入っている間の持ち物
 struct Joined {
-    field: FieldHandle,
+    /// 入った先（置き換えの頼みの行き先）
+    door: Hosted,
     /// 変動を feed へ書く係。これを止める = Presence を手放す = 出ていく
     forwarder: tokio::task::JoinHandle<()>,
+}
+
+/// 入っている、ということ。手放す（drop する）と出ていく
+enum Visit {
+    Field(Presence),
+    Relay(RelayPresence),
+}
+
+impl Visit {
+    async fn next(&mut self) -> Option<Vec<SlotUpdate>> {
+        match self {
+            Visit::Field(presence) => presence.next().await,
+            Visit::Relay(presence) => presence.next().await,
+        }
+    }
 }
 
 /// presence 1 本ぶんの応対
@@ -148,7 +171,7 @@ async fn serve_presence(
             }
             SET => {
                 let reply = match &joined {
-                    Some(joined) => set(&joined.field, &message).await,
+                    Some(joined) => set(&joined.door, &message).await,
                     None => SetReply::Refused {
                         error: "not_joined".into(),
                     },
@@ -192,8 +215,17 @@ async fn join(
         .and_then(|value| serde_json::from_value(value).ok())
         .ok_or("bad_request")?;
     let key = FieldKey::new(request.owner, request.name);
-    let field = host.get(&key).ok_or("no_such_field")?;
-    let (snapshot, presence) = field.join().await.map_err(|_| "stopped")?;
+    let door = host.find(&key).ok_or("no_such_field")?;
+    let (snapshot, visit) = match &door {
+        Hosted::Field(field) => {
+            let (snapshot, presence) = field.join().await.map_err(|_| "stopped")?;
+            (snapshot, Visit::Field(presence))
+        }
+        Hosted::Relay(relay) => {
+            let (snapshot, presence) = relay.join().map_err(|_| "stopped")?;
+            (snapshot, Visit::Relay(presence))
+        }
+    };
     // 応答より先に feed を開く。開けなければ入れない（Presence はここで手放され、出ていく）
     let feed = ctx.open_server_stream(FEED).await.map_err(|error| {
         tracing::warn!("field {key}: feed を開けない: {error}");
@@ -202,21 +234,33 @@ async fn join(
     // 書く係も応答より先に立つので、Update が応答より先に届くことがある。
     // 入った時点の状態は応答で、それより後の変動は feed で届く。
     // 道が違うので届く順番は決まらないが、受け取る側は rev で合流させる
-    let forwarder = tokio::spawn(forward(presence, feed, channel.clone()));
-    Ok((snapshot, Joined { field, forwarder }))
+    let forwarder = tokio::spawn(forward(visit, feed, channel.clone()));
+    Ok((snapshot, Joined { door, forwarder }))
 }
 
-/// 置き換えを頼まれた: field で確定し、確定した変動を返す
-async fn set(field: &FieldHandle, message: &ProtocolMessage) -> SetReply {
+/// 置き換えを頼まれた: field で確定し（中継なら上流へ運び）、確定した変動を返す
+async fn set(door: &Hosted, message: &ProtocolMessage) -> SetReply {
+    let refused = |error: &str| SetReply::Refused {
+        error: error.into(),
+    };
     let Some(request) = message
         .payload_as_value()
         .ok()
         .and_then(|value| serde_json::from_value::<SetRequest>(value).ok())
     else {
-        return SetReply::Refused {
-            error: "bad_request".into(),
-        };
+        return refused("bad_request");
     };
+    // 空の要素名は断る。中継なら、上流へ運ぶ前に
+    if request.slot.is_empty() {
+        return refused("bad_request");
+    }
+    match door {
+        Hosted::Field(field) => set_field(field, request).await,
+        Hosted::Relay(relay) => set_relay(relay, request).await,
+    }
+}
+
+async fn set_field(field: &FieldHandle, request: SetRequest) -> SetReply {
     match field.set(request.slot, request.value).await {
         Ok(update) => SetReply::Set(update),
         Err(FieldError::EmptySlotName) => SetReply::Refused {
@@ -228,16 +272,31 @@ async fn set(field: &FieldHandle, message: &ProtocolMessage) -> SetReply {
     }
 }
 
+/// 中継: 上流へ運ぶ。上流が断った理由は、そのまま返す
+async fn set_relay(relay: &RelayHandle, request: SetRequest) -> SetReply {
+    let error = match relay.set(request.slot, request.value).await {
+        Ok(update) => return SetReply::Set(update),
+        Err(SyncError::Refused(reason)) => reason,
+        Err(SyncError::Closed) => "stopped".into(),
+        // 上流に届いたか（確定したか）は分からない。確定していれば feed で届く
+        Err(SyncError::Unreachable(detail)) => {
+            tracing::warn!("中継 {}: 上流に届かない: {detail}", relay.key());
+            "unreachable".into()
+        }
+    };
+    SetReply::Refused { error }
+}
+
 /// field の変動を、入っている人の feed へ書き続ける。
 ///
-/// `Presence::next` は前回から変わった要素の今の値だけを返すので、feed への書き込みが
+/// `Visit::next` は前回から変わった要素の今の値だけを返すので、feed への書き込みが
 /// 詰まっている間に同じ要素が何度変わっても、書くのは最新の 1 つだけになる。
 ///
-/// field が止まったとき、または feed に書けなくなったとき（相手が feed を受け取っていない、
-/// 切れた）は、presence も閉じて終わる。presence が閉じる = 出ていく、なので、
+/// field（中継なら、中継か上流）が止まったとき、または feed に書けなくなったとき
+/// （相手が feed を受け取っていない、切れた）は、presence も閉じて終わる。presence が閉じる = 出ていく、なので、
 /// feed を失ったまま入っている人は残らない
-async fn forward(mut presence: Presence, feed: UnisonStream, channel: Arc<UnisonChannel>) {
-    'feed: while let Some(updates) = presence.next().await {
+async fn forward(mut visit: Visit, feed: UnisonStream, channel: Arc<UnisonChannel>) {
+    'feed: while let Some(updates) = visit.next().await {
         for update in &updates {
             let frame = serde_json::to_value(update).and_then(|payload| {
                 ProtocolMessage::new_with_json(0, UPDATE.to_string(), MessageType::Event, payload)
@@ -254,7 +313,7 @@ async fn forward(mut presence: Presence, feed: UnisonStream, channel: Arc<Unison
         }
     }
     // 先に出ていく（入っている人に数えない）。それから、相手に伝わるよう、こちらから閉じる
-    drop(presence);
+    drop(visit);
     let _ = feed.close_stream().await;
     let _ = channel.close().await;
 }

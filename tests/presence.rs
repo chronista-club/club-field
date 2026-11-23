@@ -1,16 +1,20 @@
 //! 結合テスト: 本物の QUIC で、field に入り、手元の Slave が自動で同期することを確かめる。
+//! 後半は、QUIC で下流を待ち受ける中継（`Origin ──QUIC──▶ Relay ──QUIC──▶ Leaf`）。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use field::client::{FieldSlave, JoinError};
-use field::core::{FieldKey, Place};
+use field::core::{FieldKey, FieldSnapshot, Place};
 use field::host::Host;
 use field::protocol::{
-    FieldServer, JOIN, JoinReply, JoinRequest, PRESENCE, SET, SetReply, SetRequest,
+    FEED, FieldServer, JOIN, JoinReply, JoinRequest, NAMESPACE, PRESENCE, PROTOCOL_NAME, SET,
+    SetReply, SetRequest,
 };
+use field::relay::RelayHandle;
 use field::sync::{Slave, SlotState, SlotUpdate, SyncError};
 
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -538,4 +542,417 @@ async fn failed_join_leaves_no_connection() {
     .await;
 
     let _ = handle.shutdown().await;
+}
+
+// ── 中継: QUIC で下流を待ち受ける ─────────────────────────────
+
+/// 上流（`upstream` で待ち受けている field、または中継）に入り、中継として下流を待ち受ける
+async fn start_relay(upstream: &FieldServer, key: &FieldKey) -> (RelayHandle, FieldServer) {
+    let slave = join(upstream, key).await;
+    let host = Arc::new(Host::new());
+    let relay = host.relay(slave).expect("中継を置けない");
+    let server = FieldServer::start(host, "[::1]:0")
+        .await
+        .expect("中継が待ち受けられない");
+    (relay, server)
+}
+
+/// 中継に入ろうとして断られた理由
+async fn refused_reason(server: &FieldServer, key: &FieldKey) -> String {
+    match within("入る", FieldSlave::join(server.local_addr(), key)).await {
+        Err(JoinError::Refused(reason)) => reason,
+        Err(other) => panic!("断られずに失敗した: {other}"),
+        Ok(_) => panic!("入れてしまった"),
+    }
+}
+
+/// 手元の Slave に「止まった」が伝わるまで待つ
+async fn until_dropped(slave: &mut Slave, what: &str) {
+    within(what, async { while slave.changed().await.is_some() {} }).await;
+    assert!(slave.is_closed(), "{what}");
+}
+
+/// field の側で、入っている人の数が `count` になるまで待つ
+async fn until_visitors(field: &field::runtime::FieldHandle, count: usize) {
+    within("入っている人の数", async {
+        while field.status().await.unwrap().visitors != count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn relay_delivers_origin_updates_downstream() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Cloud, 7).unwrap();
+    field.set("light", json!(0.8)).await.unwrap();
+    let (relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+
+    let mut leaf = join(&relay_server, &mako_studio()).await;
+    // 中継を通して入っても、名札と代は field のもの。入った時点の状態は待たずに手元にある
+    assert_eq!(
+        (
+            leaf.info().owner.as_str(),
+            leaf.info().place,
+            leaf.info().life
+        ),
+        ("mako", Place::Cloud, 7)
+    );
+    assert_eq!(leaf.get("light"), Some(state(1, json!(0.8))));
+    assert_eq!(relay.visitors(), 1);
+    // Origin から見ると、入っているのは中継 1 人だけ
+    assert_eq!(field.status().await.unwrap().visitors, 1);
+
+    // Origin の変動は、中継を経て自動で届く。rev は Origin が振ったまま
+    field.set("light", json!(0.5)).await.unwrap();
+    field.set("camera", json!("wide")).await.unwrap();
+    let origin = field.status().await.unwrap().snapshot.slots;
+    until(&mut leaf, "中継を経て届く", |slave| {
+        slave.snapshot().slots == origin
+    })
+    .await;
+    assert_eq!(leaf.get("light"), Some(state(2, json!(0.5))));
+
+    // 中継に無い field には入れない
+    assert_eq!(
+        refused_reason(&relay_server, &FieldKey::new("waki", "studio")).await,
+        "no_such_field"
+    );
+
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn leaf_set_through_relay_reaches_everyone() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+    let writer = join(&relay_server, &mako_studio()).await;
+    let mut other_leaf = join(&relay_server, &mako_studio()).await;
+    let mut direct = join(&origin_server, &mako_studio()).await;
+
+    let confirmed = within("中継を経て頼む", writer.set("light", json!(2)))
+        .await
+        .unwrap();
+    assert_eq!((confirmed.rev, &confirmed.value), (1, &json!(2)));
+    // Origin で確定し、応答の道で中継にも頼んだ人にも合流している
+    assert_eq!(
+        field.status().await.unwrap().snapshot.slots.get("light"),
+        Some(&state(1, json!(2)))
+    );
+    assert_eq!(
+        relay.snapshot().unwrap().slots.get("light"),
+        Some(&state(1, json!(2)))
+    );
+    assert_eq!(writer.get("light"), Some(state(1, json!(2))));
+    // 中継を通して入っている別の人にも、Origin に直接入っている人にも届く
+    for (who, slave) in [
+        ("別の Leaf", &mut other_leaf),
+        ("直結の Slave", &mut direct),
+    ] {
+        until(slave, who, |slave| {
+            slave.get("light") == Some(state(1, json!(2)))
+        })
+        .await;
+    }
+
+    // 空の要素名は、中継が上流へ運ぶ前に断る
+    assert_eq!(
+        writer.set("", json!(1)).await,
+        Err(SyncError::Refused("bad_request".into()))
+    );
+
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_leaf_sets_converge() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+    let mut a = join(&relay_server, &mako_studio()).await;
+    let mut b = join(&relay_server, &mako_studio()).await;
+    let mut direct = join(&origin_server, &mako_studio()).await;
+
+    // 持ち主・中継を通した 2 人・直結の 1 人が、同じ要素と別々の要素を、入り混じって置き換える
+    let by_owner = async {
+        for i in 0..30 {
+            field.set("light", json!(i)).await.unwrap();
+        }
+    };
+    let by_a = async {
+        for i in 0..30 {
+            a.set("light", json!(-i)).await.unwrap();
+            a.set("camera", json!(i)).await.unwrap();
+        }
+    };
+    let by_b = async {
+        for i in 0..30 {
+            b.set("light", json!(100 + i)).await.unwrap();
+        }
+    };
+    let by_direct = async {
+        for i in 0..30 {
+            direct.set("sound", json!(i)).await.unwrap();
+        }
+    };
+    within("置き換える", async {
+        tokio::join!(by_owner, by_a, by_b, by_direct)
+    })
+    .await;
+
+    // 落ち着けば、全員の手元が Origin の確定値と同じになる
+    let origin = field.status().await.unwrap().snapshot.slots;
+    assert_eq!(origin["light"].rev, 90);
+    assert_eq!(origin["camera"].rev, 30);
+    assert_eq!(origin["sound"].rev, 30);
+    for (who, slave) in [("a", &mut a), ("b", &mut b), ("直結", &mut direct)] {
+        until(slave, who, |slave| slave.snapshot().slots == origin).await;
+    }
+    within("中継が揃う", async {
+        while relay.snapshot().unwrap().slots != origin {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn leaf_leaving_keeps_others_running() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+    let leaving = join(&relay_server, &mako_studio()).await;
+    let mut staying = join(&relay_server, &mako_studio()).await;
+    assert_eq!(relay.visitors(), 2);
+
+    leaving.leave().await;
+    within("出ていったことが中継に伝わる", async {
+        while relay.visitors() != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    // 中継も Origin も、残った Leaf も動き続ける
+    assert!(!relay.is_stopped());
+    assert_eq!(field.status().await.unwrap().visitors, 1);
+    field.set("light", json!(1)).await.unwrap();
+    until(&mut staying, "残った Leaf に届く", |slave| {
+        slave.get("light") == Some(state(1, json!(1)))
+    })
+    .await;
+    assert!(staying.set("camera", json!(2)).await.is_ok());
+
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn relay_stop_drops_only_its_leaves() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+    let mut leaf = join(&relay_server, &mako_studio()).await;
+    let mut direct = join(&origin_server, &mako_studio()).await;
+    until_visitors(&field, 2).await;
+
+    relay.stop().await;
+    // 中継の下流には「止まった」が伝わる
+    until_dropped(&mut leaf, "Leaf が外れる").await;
+    assert_eq!(leaf.set("light", json!(1)).await, Err(SyncError::Closed));
+    // 中継は上流から出ていった。Origin と直結の Slave は動き続ける
+    until_visitors(&field, 1).await;
+    field.set("light", json!(1)).await.unwrap();
+    until(&mut direct, "直結の Slave に届く", |slave| {
+        slave.get("light") == Some(state(1, json!(1)))
+    })
+    .await;
+    // 止まった中継には入れない
+    assert_eq!(
+        refused_reason(&relay_server, &mako_studio()).await,
+        "stopped"
+    );
+
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+#[tokio::test]
+async fn origin_stop_reaches_leaves_through_relay() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (relay, relay_server) = start_relay(&origin_server, &mako_studio()).await;
+    let mut leaf = join(&relay_server, &mako_studio()).await;
+    let mut watching = relay.observe().unwrap();
+
+    field.stop().await;
+    // 中継にも、中継の下流にも「止まった」が伝わる
+    within("中継が外れる", async {
+        while watching.next().await.is_some() {}
+    })
+    .await;
+    assert!(relay.is_stopped());
+    until_dropped(&mut leaf, "Leaf が外れる").await;
+    // 止まった中継には入れない
+    assert_eq!(
+        refused_reason(&relay_server, &mako_studio()).await,
+        "stopped"
+    );
+
+    relay.stop().await;
+    relay_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+/// `Origin ──QUIC──▶ Relay 1 ──QUIC──▶ Relay 2 ──QUIC──▶ Leaf`
+#[tokio::test]
+async fn relay_chain_over_quic() {
+    let (host, origin_server) = start().await;
+    let field = host.create(mako_studio(), Place::Local, 1).unwrap();
+    let (first, first_server) = start_relay(&origin_server, &mako_studio()).await;
+    let (second, second_server) = start_relay(&first_server, &mako_studio()).await;
+    let mut leaf = join(&second_server, &mako_studio()).await;
+
+    // 下りの道: Origin の変動は 2 段の中継を経て届く
+    field.set("light", json!(1)).await.unwrap();
+    until(&mut leaf, "3 段めに届く", |slave| {
+        slave.get("light") == Some(state(1, json!(1)))
+    })
+    .await;
+
+    // 上りの道: Leaf の頼みは 2 段の中継を経て Origin で確定し、各段に合流する
+    let confirmed = within("3 段めから頼む", leaf.set("camera", json!("wide")))
+        .await
+        .unwrap();
+    assert_eq!(confirmed.rev, 1);
+    assert_eq!(
+        field.status().await.unwrap().snapshot.slots.get("camera"),
+        Some(&state(1, json!("wide")))
+    );
+    for (who, relay) in [("Relay 1", &first), ("Relay 2", &second)] {
+        assert_eq!(
+            relay.snapshot().unwrap().slots.get("camera"),
+            Some(&state(1, json!("wide"))),
+            "{who}"
+        );
+    }
+    assert_eq!(leaf.get("camera"), Some(state(1, json!("wide"))));
+
+    // 真ん中の中継が止まると、その先は外れる。手前の中継と Origin は動き続ける
+    second.stop().await;
+    until_dropped(&mut leaf, "Leaf が外れる").await;
+    assert!(!first.is_stopped());
+    assert!(first.set("light", json!(2)).await.is_ok());
+
+    second_server.shutdown().await;
+    first.stop().await;
+    first_server.shutdown().await;
+    origin_server.shutdown().await;
+}
+
+/// `slow` という要素の頼みにだけ返事をしない、偽の上流（field の代わり）
+async fn start_stalling_upstream() -> unison::network::server::ServerHandle {
+    use unison::network::{MessageType, UnisonChannel};
+
+    let server = unison::ProtocolServer::with_identity(PROTOCOL_NAME, "0.0.0", NAMESPACE);
+    server
+        .register_channel(PRESENCE, |ctx, stream| async move {
+            let channel = UnisonChannel::new(stream);
+            let mut rev = 0;
+            // feed は開いたまま持っておく（何も書かない）
+            let mut _feed = None;
+            loop {
+                let Ok(message) = channel.recv().await else {
+                    return Ok(());
+                };
+                if message.msg_type != MessageType::Request {
+                    continue;
+                }
+                match message.method.as_str() {
+                    JOIN => {
+                        _feed = Some(ctx.open_server_stream(FEED).await?);
+                        let snapshot = FieldSnapshot {
+                            owner: "mako".into(),
+                            name: "studio".into(),
+                            place: Place::Local,
+                            life: 1,
+                            slots: BTreeMap::new(),
+                        };
+                        channel
+                            .send_response(message.id, JOIN, &JoinReply::Joined(snapshot))
+                            .await?;
+                    }
+                    SET => {
+                        let request: SetRequest =
+                            serde_json::from_value(message.payload_as_value()?).unwrap();
+                        if request.slot == "slow" {
+                            continue;
+                        }
+                        rev += 1;
+                        let update = SlotUpdate {
+                            life: 1,
+                            slot: request.slot,
+                            rev,
+                            value: request.value,
+                        };
+                        channel
+                            .send_response(message.id, SET, &SetReply::Set(update))
+                            .await?;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+    Arc::new(server)
+        .listener("[::1]:0")
+        .spawn()
+        .await
+        .expect("偽の上流が立ち上がらない")
+}
+
+/// 中継が、ある Leaf の頼みで上流の返事を待っていても、ほかの Leaf は入れて、頼める
+#[tokio::test]
+async fn relay_waiting_upstream_holds_up_no_other_leaf() {
+    let upstream = start_stalling_upstream().await;
+    let slave = within(
+        "上流に入る",
+        FieldSlave::join(upstream.local_addr(), &mako_studio()),
+    )
+    .await
+    .unwrap();
+    let host = Arc::new(Host::new());
+    let relay = host.relay(slave).unwrap();
+    let relay_server = FieldServer::start(host, "[::1]:0").await.unwrap();
+
+    let stuck = Arc::new(join(&relay_server, &mako_studio()).await);
+    let slow = tokio::spawn({
+        let stuck = stuck.clone();
+        async move { stuck.set("slow", json!(1)).await }
+    });
+    // 頼みが中継に届き、上流の返事を待ち始めるまで
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!slow.is_finished());
+
+    let other = join(&relay_server, &mako_studio()).await;
+    let fast = within("ほかの Leaf の頼み", other.set("fast", json!(2)))
+        .await
+        .unwrap();
+    assert_eq!((fast.rev, &fast.value), (1, &json!(2)));
+    assert!(!slow.is_finished());
+
+    // 中継が止まると、返事を待っていた頼みも終わる（上流の時間切れを待たない）
+    relay.stop().await;
+    let slow = within("待っていた頼みが終わる", slow).await.unwrap();
+    assert!(slow.is_err(), "{slow:?}");
+
+    relay_server.shutdown().await;
+    let _ = upstream.shutdown().await;
 }

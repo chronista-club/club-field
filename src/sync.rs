@@ -423,7 +423,14 @@ impl Upstream for Link {
             if self.shared.is_closed() {
                 return Err(SyncError::Closed);
             }
-            let confirmed = self.upstream.set(slot, value).await?;
+            // 返事を待つ間に上流から外れたら、待つのをやめる。
+            // 外れた上流の返事は、届かないか、届いても遅れて（運び方の時間切れで）しか来ない
+            let mut version = self.shared.version.subscribe();
+            let confirmed = tokio::select! {
+                biased;
+                confirmed = self.upstream.set(slot, value) => confirmed?,
+                _ = version.wait_for(|version| version.closed) => return Err(SyncError::Closed),
+            };
             // 応答の道でも合流させる。頼んだ側は、変動の知らせを待たずに確定した値を持つ。
             // 知らせのほうが先に届いていても、古い rev は捨てられるので戻らない
             self.shared.merge(&confirmed);
@@ -827,6 +834,51 @@ mod tests {
         );
         inlet.close();
         assert_eq!(within("終わり", slave.changed()).await, None);
+    }
+
+    /// 返事をしない上流（届かなくなった上流の代わり）
+    struct Silent;
+
+    impl Upstream for Silent {
+        fn set(&self, _slot: String, _value: Value) -> SetFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_set_ends_when_slave_is_closed() {
+        let (slave, inlet) = Slave::new(Snapshot::default(), Arc::new(Silent));
+        let slave = Arc::new(slave);
+        let pending = tokio::spawn({
+            let slave = slave.clone();
+            async move { slave.set("light", json!(1)).await }
+        });
+        tokio::task::yield_now().await;
+        // 上流から外れたら、返事を待っている頼みも終わる（上流の返事を待ち続けない）
+        inlet.close();
+        assert_eq!(
+            within("頼みが終わる", pending).await.unwrap(),
+            Err(SyncError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_relayed_set_ends_when_relay_leaves() {
+        let (relay, inlet) = Slave::new(Snapshot::default(), Arc::new(Silent));
+        // 受け取り係の代わり: 中継が手放されたら、上流から外れる
+        tokio::spawn(async move { inlet.slave_gone().await });
+        let downstream = Arc::new(Slave::follow(&relay));
+        let pending = tokio::spawn({
+            let downstream = downstream.clone();
+            async move { downstream.set("light", json!(1)).await }
+        });
+        tokio::task::yield_now().await;
+        // 中継が手放されると、中継を経て返事を待っていた下流の頼みも終わる
+        drop(relay);
+        assert_eq!(
+            within("頼みが終わる", pending).await.unwrap(),
+            Err(SyncError::Closed)
+        );
     }
 
     #[tokio::test]

@@ -107,6 +107,12 @@ impl FieldSlave {
         drop(slave);
         let _ = pump.await;
     }
+
+    /// 名札・写し・吸い上げる係に分ける（中継として預けるとき）。
+    /// 写しを手放すと出ていき、吸い上げる係はつながりを閉じ終えたら終わる
+    pub(crate) fn into_parts(self) -> (FieldInfo, Slave, tokio::task::JoinHandle<()>) {
+        (self.info, self.slave, self.pump)
+    }
 }
 
 impl Deref for FieldSlave {

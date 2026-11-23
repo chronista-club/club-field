@@ -1,8 +1,11 @@
 //! `field` コマンド。
 //!
 //! - `field up`    自分の field を持つ（動かし始める）。標準入力の `<要素> <値>` で要素を置き換える
+//! - `field relay` 動いている field（または中継）に入り、中継として下流を待ち受ける
 //! - `field watch` 動いている field に入り、手元の Slave の変動を表示する（確かめ用）
 //! - `field set`   動いている field に入り、要素の置き換えを頼む（確かめ用）
+//!
+//! `watch` / `set` / `relay` のつなぐ先は、field でも中継でもよい（同じ受け答えをする）。
 //!
 //! 値は JSON として読む。JSON として読めなければ文字列として扱う
 //! （`0.8` は数、`true` は真偽値、`calm` は文字列 `"calm"`）。
@@ -21,7 +24,7 @@ use field::core::{FieldKey, Place};
 use field::host::Host;
 use field::protocol::FieldServer;
 use field::runtime::FieldHandle;
-use field::sync::SlotUpdate;
+use field::sync::{SlotUpdate, Subscription};
 
 /// 待ち受け先の既定。ポート番号は仮（台帳で正式に取るまで）
 const DEFAULT_ADDR: &str = "[::1]:7880";
@@ -52,6 +55,22 @@ enum Command {
         /// 初めに置く要素（`<要素>=<値>`、何度でも）
         #[arg(long = "set", value_name = "SLOT=VALUE")]
         initial: Vec<String>,
+    },
+    /// 動いている field（または中継）に入り、中継として下流を待ち受ける。Ctrl-C で止まる
+    Relay {
+        /// 持ち主
+        #[arg(long)]
+        owner: String,
+        /// field の名前
+        #[arg(long)]
+        name: String,
+        /// 上流（field、または別の中継）
+        #[arg(long, default_value = DEFAULT_ADDR)]
+        connect: SocketAddr,
+        /// 待ち受け先（例: `[::1]:7881`）。上流と同じマシンで動かすことが多いので、既定は置かない。
+        /// ポート 0 なら空いているポートを使う。認可がまだ無いので、loopback だけ
+        #[arg(long)]
+        listen: SocketAddr,
     },
     /// 動いている field に入り、手元の Slave の変動を表示する（確かめ用）
     Watch {
@@ -113,6 +132,12 @@ async fn main() -> anyhow::Result<()> {
             listen,
             initial,
         } => up(FieldKey::new(owner, name), place.into(), listen, initial).await,
+        Command::Relay {
+            owner,
+            name,
+            connect,
+            listen,
+        } => relay(FieldKey::new(owner, name), connect, listen).await,
         Command::Watch {
             owner,
             name,
@@ -145,17 +170,32 @@ fn show(update: &SlotUpdate) -> String {
     format!("{} = {}（rev {}）", update.slot, update.value, update.rev)
 }
 
+/// 待ち受け先は loopback だけ（認可がまだ無いので）
+fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
+    if !listen.ip().is_loopback() {
+        bail!(
+            "{listen} は自分のマシンの外から届く。認可がまだ無いので、loopback（例: {DEFAULT_ADDR}）だけにしてある"
+        );
+    }
+    Ok(())
+}
+
+/// 変動を表示し続ける。配り手が止まったら終わる
+async fn print_changes(mut changes: Subscription) {
+    while let Some(updates) = changes.next().await {
+        for update in &updates {
+            println!("{}", show(update));
+        }
+    }
+}
+
 async fn up(
     key: FieldKey,
     place: Place,
     listen: SocketAddr,
     initial: Vec<String>,
 ) -> anyhow::Result<()> {
-    if !listen.ip().is_loopback() {
-        bail!(
-            "{listen} は自分のマシンの外から届く。認可がまだ無いので、loopback（例: {DEFAULT_ADDR}）だけにしてある"
-        );
-    }
+    ensure_loopback(listen)?;
     let initial = initial
         .iter()
         .map(|pair| {
@@ -197,14 +237,8 @@ async fn up(
     println!("要素を置き換えるには `<要素> <値>` を入力。止めるには Ctrl-C");
 
     // 誰が置き換えても（手元でも、入っている人からの頼みでも）、変動をここに表示する
-    let mut changes = field.observe().await.context("field が止まった")?;
-    tokio::spawn(async move {
-        while let Some(updates) = changes.next().await {
-            for update in &updates {
-                println!("{}", show(update));
-            }
-        }
-    });
+    let changes = field.observe().await.context("field が止まった")?;
+    tokio::spawn(print_changes(changes));
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut reading = true;
@@ -241,6 +275,57 @@ async fn put_line(field: &FieldHandle, line: &str) {
     if let Err(error) = field.set(slot, parse_value(value.trim())).await {
         eprintln!("置き換えられない: {error}");
     }
+}
+
+async fn relay(key: FieldKey, connect: SocketAddr, listen: SocketAddr) -> anyhow::Result<()> {
+    ensure_loopback(listen)?;
+    let slave = FieldSlave::join(connect, &key)
+        .await
+        .with_context(|| format!("{connect} の field {key} に入れない"))?;
+    let host = Arc::new(Host::new());
+    let relay = host.relay(slave)?;
+    let server = match FieldServer::start(host, &listen.to_string()).await {
+        Ok(server) => server,
+        Err(error) => {
+            relay.stop().await;
+            return Err(error.context(format!("{listen} で待ち受けられない")));
+        }
+    };
+
+    let info = relay.info().clone();
+    println!(
+        "field {key} を中継している（場所 {:?}、代 {}、上流 {connect}、待ち受け {}）",
+        info.place,
+        info.life,
+        server.local_addr()
+    );
+    // 中継の手元の状態と、以後の変動（上流から届いたものも、下流の頼みで確定したものも）を表示する
+    let changes = relay.observe();
+    for (slot, state) in relay.snapshot().map(|s| s.slots).unwrap_or_default() {
+        println!("  {slot} = {}（rev {}）", state.value, state.rev);
+    }
+    println!("止めるには Ctrl-C");
+
+    // 上流が止まる・切れると、変動の購読が終わる
+    let upstream_stopped = match changes {
+        Some(changes) => tokio::select! {
+            _ = print_changes(changes) => true,
+            _ = tokio::signal::ctrl_c() => false,
+        },
+        None => true,
+    };
+    if upstream_stopped {
+        println!("上流が止まった");
+    } else {
+        println!();
+        println!("止める");
+    }
+    // 上流から出ていき、下流を全員外す（上流が止まったときは、外れ終わっている）。
+    // 下流に「止まった」が伝わるのを待ってから、待ち受けをやめる
+    relay.stop().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.shutdown().await;
+    Ok(())
 }
 
 async fn watch(key: FieldKey, connect: SocketAddr) -> anyhow::Result<()> {
