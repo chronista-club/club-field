@@ -99,6 +99,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::sync::{Origin, Relay, Slave};
 
     fn mako_studio() -> FieldKey {
         FieldKey::new("mako", "studio")
@@ -172,21 +173,21 @@ mod tests {
     }
 
     /// 同じプロセスの Origin に入っている Slave を、中継として預かる
-    fn relay_of(origin: &crate::sync::Origin, key: &FieldKey) -> RelayHandle {
+    fn relay_of(origin: &Origin, key: &FieldKey) -> RelayHandle {
         let info = crate::core::FieldInfo {
             owner: key.owner.clone(),
             name: key.name.clone(),
             place: Place::Local,
             life: origin.life(),
         };
-        RelayHandle::hold(info, crate::sync::Slave::follow(origin), None)
+        RelayHandle::hold(info, Relay::from_slave(Slave::follow(origin)))
     }
 
     #[tokio::test]
     async fn relay_sits_beside_fields() {
         let host = Host::new();
         host.create(mako_live(), Place::Cloud, 1).unwrap();
-        let origin = crate::sync::Origin::new(1);
+        let origin = Origin::new(1);
         // 中継は、上流の field と同じ鍵で置かれる
         let relay = host.add_relay(relay_of(&origin, &mako_studio())).unwrap();
         assert_eq!(relay.key(), &mako_studio());
@@ -200,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn relay_and_field_cannot_share_a_key() {
         let host = Host::new();
-        let origin = crate::sync::Origin::new(1);
+        let origin = Origin::new(1);
         host.create(mako_studio(), Place::Local, 1).unwrap();
         assert_eq!(
             host.add_relay(relay_of(&origin, &mako_studio())).err(),
